@@ -1,0 +1,7 @@
+[submodule "submodules/simple_knn"]
+	path = submodules/simple_knn
+	url = https://github.com/shuyueW1991/simple_knn_illustration.git
+	branch = main
+[submodule "submodules/RepViT"]
+	path = submodules/RepViT
+	url = git@github.com:THU-MIG/RepViT.git

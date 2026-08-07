@@ -1,0 +1,1442 @@
+"""
+WonderPlay run_genesis: one-click scene compositional reconstruction and simulation.
+Run from repo root: python WonderPlay_new/run_genesis.py
+Depth: Marigold only. Image-to-3D: InstantMesh only (in models).
+Local modules (WonderPlay_new): util, models, arguments, gaussian_renderer, scene, utils,
+  syncdiffusion, marigold_lcm, simulator.
+"""
+import gc
+import os
+import random
+import sys
+import time
+import json
+import warnings
+import importlib
+from argparse import ArgumentParser
+from pathlib import Path
+from datetime import datetime
+from random import randint
+
+# Ensure WonderPlay_new is on path when run from repo root (e.g. python WonderPlay_new/run_genesis.py)
+_WONDERPLAY_DIR = Path(__file__).resolve().parent
+if str(_WONDERPLAY_DIR) not in sys.path:
+    sys.path.insert(0, str(_WONDERPLAY_DIR))
+
+_HF_HOME = Path(os.environ.get("HF_HOME", "/root/autodl-tmp/huggingface"))
+_HF_HUB_CACHE = Path(os.environ.get("HF_HUB_CACHE", _HF_HOME / "hub"))
+os.environ.setdefault("HF_HOME", str(_HF_HOME))
+os.environ.setdefault("HF_HUB_CACHE", str(_HF_HUB_CACHE))
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(_HF_HUB_CACHE))
+# The local Mihomo proxy can reach Hugging Face directly.  hf-mirror redirects
+# some Hub metadata requests in a way that huggingface_hub rejects.
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+import imageio
+from omegaconf import OmegaConf
+from tqdm import tqdm
+from torchvision.transforms import ToPILImage, ToTensor
+from torchvision.utils import flow_to_image
+from huggingface_hub import hf_hub_download
+from diffusers import (
+    AutoencoderKL,
+    DDIMScheduler,
+    EulerDiscreteScheduler,
+    DiffusionPipeline,
+    EulerAncestralDiscreteScheduler,
+)
+from diffusers.models.attention_processor import AttnProcessor2_0
+from transformers import (
+    CLIPTokenizer,
+    OneFormerForUniversalSegmentation,
+    OneFormerImageProcessor,
+    OneFormerProcessor,
+)
+from kornia.morphology import dilation
+
+# WonderPlay_new local
+from util.utils import (
+    sam_get_amg_kwargs,
+    save_depth_map,
+    prepare_scheduler,
+    soft_stitching,
+    crop_to_square,
+    convert_pt3d_cam_to_3dgs_cam,
+)
+from util.stable_diffusion_inpaint import StableDiffusionInpaintPipeline
+from util.segment_utils import create_mask_generator_repvit
+from models.models import KeyframeGen, save_point_cloud_as_ply, debug_vis_func
+from arguments import GSParams, CameraParams
+from gaussian_renderer import render, render_w_shift, render_w_shift_flow, render_w_shift_da
+from gaussian_renderer.living_world_render import render_MLP, pre_euler_integral
+from hashgrid import HashEncoderMotionModel
+from scene import Scene, GaussianModel
+from scene.cameras import Camera
+from utils.loss import l1_loss, ssim
+from utils.flow import visualize_flow_as_arrows, camera_traj
+from syncdiffusion.syncdiffusion_model import SyncDiffusion
+from simulator.diff_simulator_v3 import Simulator
+
+from marigold_lcm.marigold_pipeline import (
+    MarigoldPipeline,
+    MarigoldPipelineNormal,
+    MarigoldNormalsPipeline,
+)
+import pyvista as pv
+
+warnings.filterwarnings("ignore")
+
+xyz_scale = 1000
+scene_name = None
+view_matrix = [-1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+view_matrix_wonder = [-1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+background = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32, device="cuda")
+iter_number = None
+kf_gen = None
+gaussians = None
+opt = None
+scene_dict = None
+style_prompt = None
+pt_gen = None
+
+sim = None
+movement = None
+already_object_pts_num = 0
+
+
+def empty_cache():
+    torch.cuda.empty_cache()
+    gc.collect()
+
+
+# ========== LivingWorld Environment Motion Functions ==========
+
+def train_hashgrid(pc, model, scheduler_gamma=0.2, scheduler_step=100, iterations=100, lr=1e-2, device='cuda', freeze_mlp=False):
+    """
+    Train HashGrid motion model (from LivingWorld)
+    """
+    means3D = pc.get_xyz_all
+    scene_flow = pc.get_scene_flow_all
+
+    assert means3D.shape[0] == scene_flow.shape[0]
+
+    pos_all = means3D.detach().clone().to(device).requires_grad_(True)
+    flow_all = scene_flow.detach().clone().to(device).requires_grad_(False)
+
+    with torch.no_grad():
+        if not (hasattr(model, "center") and hasattr(model, "bound_xyz")):
+            pos_min = pos_all.min(0).values
+            pos_max = pos_all.max(0).values
+            center = 0.5 * (pos_min + pos_max)
+            half_extent = 0.5 * (pos_max - pos_min)
+            bound_xyz = half_extent.clamp_min(1e-6)
+
+            model.center = center
+            model.bound_xyz = bound_xyz
+
+    model.train()
+
+    pos_extent = pos_all.max(0).values - pos_all.min(0).values
+
+    if not hasattr(model, "flow_scale"):
+        current_mag = flow_all.norm(dim=1).mean()
+        WW_VEL_MEAN = torch.tensor([
+            0.0006032090168446302,
+            6.930906238267198e-05,
+            8.437281394435558e-06
+        ], device=scene_flow.device)
+
+        target_mean = WW_VEL_MEAN * 10.0
+        target_mag = target_mean.norm()
+        model.flow_scale = (target_mag / current_mag.clamp_min(1e-12)).item()
+
+    flow_train = flow_all * model.flow_scale
+
+    flow_mean = flow_train.mean(0)
+    flow_std  = flow_train.std(0)
+    flow_abs_mean = flow_train.abs().mean(0)
+    flow_max = flow_train.abs().max(0).values
+
+    print(f"[train_hashgrid] Flow training stats:")
+    print(f"  mean: {flow_mean.cpu().numpy()}")
+    print(f"  std: {flow_std.cpu().numpy()}")
+    print(f"  abs_mean: {flow_abs_mean.cpu().numpy()}")
+    print(f"  max: {flow_max.cpu().numpy()}")
+    print(f"  flow_scale: {model.flow_scale}")
+
+    if freeze_mlp:
+        for p in model.mlp.parameters():
+            p.requires_grad = False
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.99), eps=1e-15)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step, gamma=scheduler_gamma)
+
+    for iteration in range(iterations):
+        pred_flow = model(pos_all)
+        loss = torch.nn.functional.mse_loss(pred_flow, flow_train)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        if iteration % 20 == 0 or iteration == iterations - 1:
+            print(f"[train_hashgrid] iter {iteration}/{iterations}, loss: {loss.item():.6f}, lr: {scheduler.get_last_lr()[0]:.2e}")
+
+    model.eval()
+    print(f"[train_hashgrid] Training completed!")
+    return model
+
+
+# ========== End LivingWorld Functions ==========
+
+
+def seeding(seed):
+    if seed == -1:
+        seed = np.random.randint(2**32)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    print(f"running with seed: {seed}.")
+
+
+# ========== Environment Motion Rendering Function ==========
+
+def environment_motion_rendering(gaussians, scene, save_dir, config, video_gen_fps):
+    """
+    LivingWorld environment motion rendering using HashGrid MLP
+    """
+    global iter_number, kf_gen, opt, background
+
+    print("[environment_motion_rendering] Starting environment motion rendering...")
+
+    # Get configuration
+    env_config = config.get('environment_motion', {})
+    scale_factor = env_config.get('scale_factor', 2.0)
+    num_frames = 100
+
+    # Initialize scene_flow and motion_mask
+    means3D = gaussians.get_xyz_all
+    scene_flow = torch.zeros_like(means3D)
+
+    # Fixed motion direction: forward (y-axis)
+    scene_flow[:, 1] = 0.001
+
+    # Set to gaussians object
+    gaussians._scene_flow_all = scene_flow
+    gaussians._motion_mask_all = torch.ones(means3D.shape[0], 1, dtype=torch.bool, device='cuda')
+
+    print(f"[environment_motion_rendering] Initialized scene_flow for {means3D.shape[0]} points")
+    print(f"[environment_motion_rendering] Motion direction: {scene_flow.mean(dim=0).cpu().numpy()}")
+
+    # Train HashGrid motion model
+    from hashgrid import HashEncoderMotionModel
+    print("[environment_motion_rendering] Training HashGrid motion model...")
+    motion_model = HashEncoderMotionModel().to('cuda')
+    motion_model = train_hashgrid(gaussians, motion_model, iterations=100)
+
+    # Setup camera
+    viewpoint_stack = scene.getTrainCameras().copy()
+    viewpoint_cam = viewpoint_stack[0]
+    gt_image = viewpoint_cam.original_image.cuda()
+    ToPILImage()(gt_image).save(save_dir / f"gt.png")
+
+    # Create output directory
+    output_dir = save_dir / 'environment_motion'
+    output_dir.mkdir(exist_ok=True, parents=True)
+
+    # Rendering loop
+    print(f"[environment_motion_rendering] Rendering {num_frames} frames with scale_factor={scale_factor}...")
+
+    frames = []
+    for frame_idx in tqdm(range(num_frames), desc="Rendering frames"):
+        render_pkg = render_MLP(
+            viewpoint_camera=viewpoint_cam,
+            pc=gaussians,
+            motion_model=motion_model,
+            t=frame_idx,
+            opt=opt,
+            bg_color=background,
+            scale_factor=scale_factor,
+            render_visible=True
+        )
+
+        # Save frame
+        image = render_pkg['render']
+        image_np = (image.permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)
+        frames.append(image_np)
+        Image.fromarray(image_np).save(output_dir / f"frame_{frame_idx:04d}.png")
+
+    # Save as video
+    print(f"[environment_motion_rendering] Saving video...")
+    imageio.mimsave(
+        (output_dir / "environment_motion.mp4").as_posix(),
+        frames,
+        fps=video_gen_fps
+    )
+
+    print(f"[environment_motion_rendering] Completed! Saved to {output_dir}")
+    print(f"  - {num_frames} frames")
+    print(f"  - Video: environment_motion.mp4")
+
+
+# ========== End Environment Motion Function ==========
+
+
+def _hf_snapshot_dir(repo_id, repo_type):
+    """Return a locally cached Hugging Face snapshot, if one is available."""
+    cache_dirs = []
+    for env_name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        value = os.environ.get(env_name)
+        if value:
+            cache_dirs.append(Path(value))
+
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        cache_dirs.append(Path(hf_home) / "hub")
+
+    cache_dirs.append(Path.home() / ".cache" / "huggingface" / "hub")
+    # AutoDL commonly keeps persistent model caches outside the home directory.
+    cache_dirs.append(_HF_HUB_CACHE)
+
+    repo_prefix = "datasets" if repo_type == "dataset" else "models"
+    repo_dir_name = f"{repo_prefix}--{repo_id.replace('/', '--')}"
+    for cache_dir in dict.fromkeys(cache_dirs):
+        repo_dir = cache_dir / repo_dir_name
+        ref_path = repo_dir / "refs" / "main"
+        if ref_path.is_file():
+            snapshot_dir = repo_dir / "snapshots" / ref_path.read_text().strip()
+            if snapshot_dir.is_dir():
+                return snapshot_dir
+    return None
+
+
+def _cached_model_source(repo_id, fallback_repo_id=None):
+    candidates = [repo_id]
+    if fallback_repo_id and fallback_repo_id not in candidates:
+        candidates.append(fallback_repo_id)
+
+    for candidate in candidates:
+        snapshot_dir = _hf_snapshot_dir(candidate, "model")
+        if snapshot_dir is not None:
+            return str(snapshot_dir), True
+    return repo_id, False
+
+
+def _fp16_safetensors_kwargs(model_source):
+    model_dir = Path(model_source)
+    if not model_dir.is_dir():
+        return {}
+
+    has_fp16_vae = (
+        model_dir / "vae" / "diffusion_pytorch_model.fp16.safetensors"
+    ).is_file()
+    has_fp16_unet = (
+        model_dir / "unet" / "diffusion_pytorch_model.fp16.safetensors"
+    ).is_file()
+    if has_fp16_vae and has_fp16_unet:
+        return {"variant": "fp16", "use_safetensors": True}
+    return {}
+
+
+def load_oneformer():
+    """Load OneFormer from a local cache without fetching its ADE20K metadata."""
+    model_id = "shi-labs/oneformer_ade20k_swin_large"
+    model_dir = _hf_snapshot_dir(model_id, "model")
+    metadata_dir = _hf_snapshot_dir("shi-labs/oneformer_demo", "dataset")
+
+    if model_dir is None or metadata_dir is None:
+        processor = OneFormerProcessor.from_pretrained(model_id)
+        model = OneFormerForUniversalSegmentation.from_pretrained(model_id)
+        return processor, model
+
+    processor_config = json.loads((model_dir / "preprocessor_config.json").read_text())
+    processor_config["repo_path"] = str(metadata_dir)
+    image_processor = OneFormerImageProcessor(**processor_config)
+    tokenizer = CLIPTokenizer.from_pretrained(model_dir, local_files_only=True)
+    processor = OneFormerProcessor(image_processor=image_processor, tokenizer=tokenizer)
+    model = OneFormerForUniversalSegmentation.from_pretrained(
+        model_dir, local_files_only=True
+    )
+    return processor, model
+
+
+def run(config, dt_string=None):
+    global view_matrix, scene_name, kf_gen, gaussians, opt, background, scene_dict, style_prompt, pt_gen
+    global sim, movement
+    ###### ------------------ Load modules ------------------ ######
+
+    seeding(config["seed"])
+    example = config["example_name"]
+
+    segment_processor, segment_model = load_oneformer()
+    segment_model = segment_model.to("cuda")
+
+    mask_generator = create_mask_generator_repvit()
+
+    inpaint_checkpoint, inpaint_is_local = _cached_model_source(
+        config["stable_diffusion_checkpoint"],
+        fallback_repo_id="sd2-community/stable-diffusion-2-inpainting",
+    )
+    inpainter_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
+        inpaint_checkpoint,
+        safety_checker=None,
+        torch_dtype=torch.bfloat16,
+        cache_dir=str(_HF_HUB_CACHE),
+        local_files_only=inpaint_is_local,
+        **_fp16_safetensors_kwargs(inpaint_checkpoint),
+    ).to(config["device"])
+    inpainter_pipeline.scheduler = DDIMScheduler.from_config(
+        inpainter_pipeline.scheduler.config
+    )
+    inpainter_pipeline.unet.set_attn_processor(AttnProcessor2_0())
+    inpainter_pipeline.vae.set_attn_processor(AttnProcessor2_0())
+
+    rotation_path = config["rotation_path"][: config["num_scenes"]]
+    assert len(rotation_path) == config["num_scenes"]
+
+    # Depth estimation: Marigold only
+    depth_model = MarigoldPipeline.from_pretrained(
+        "prs-eth/marigold-v1-0",
+        torch_dtype=torch.bfloat16,
+        cache_dir=str(_HF_HUB_CACHE),
+    ).to(config["device"])
+    depth_model.scheduler = EulerDiscreteScheduler.from_config(
+        depth_model.scheduler.config
+    )
+    depth_model.scheduler = prepare_scheduler(depth_model.scheduler)
+
+    normals_checkpoint, normals_are_local = _cached_model_source(
+        "prs-eth/marigold-normals-v0-1"
+    )
+    normal_estimator = MarigoldNormalsPipeline.from_pretrained(
+        normals_checkpoint,
+        torch_dtype=torch.bfloat16,
+        cache_dir=str(_HF_HUB_CACHE),
+        local_files_only=normals_are_local,
+        variant="fp16",
+        use_safetensors=True,
+    ).to(config["device"])
+
+    # Skip mvdiffusion loading for environment motion mode
+    motion_type = config.get("motion_type", "object")
+    if motion_type == "environment":
+        print("[INFO] Skipping mvdiffusion loading (not needed for environment motion)")
+        mvdiffusion = None
+    else:
+        mvdiffusion = DiffusionPipeline.from_pretrained(
+            "sudo-ai/zero123plus-v1.2",
+            custom_pipeline="zero123plus",
+            torch_dtype=torch.float16,
+            cache_dir=str(_HF_HUB_CACHE),
+        ).to(config["device"])
+        mvdiffusion.scheduler = EulerAncestralDiscreteScheduler.from_config(
+            mvdiffusion.scheduler.config, timestep_spacing="trailing"
+        )
+        # load InstantMesh finetuned white-background UNet
+        print("Loading custom white-background unet ...")
+        unet_ckpt_path = hf_hub_download(
+            repo_id="TencentARC/InstantMesh",
+            filename="diffusion_pytorch_model.bin",
+            repo_type="model",
+            cache_dir=str(_HF_HUB_CACHE),
+        )
+        state_dict = torch.load(unet_ckpt_path, map_location="cpu")
+        mvdiffusion.unet.load_state_dict(state_dict, strict=True)
+
+    # sam_model = sam_model_registry['vit_l'](checkpoint="/viscam/projects/wonder_dy/zzli/ckpts/sam_vit_l_0b3195.pth")
+    # _ = sam_model.to(device=config["device"])
+    # output_mode = "binary_mask"
+    # amg_kwargs = sam_get_amg_kwargs()
+    # sam_generator = SamPredictor(sam_model)
+
+    # Resolve all paths relative to repo root (so running from repo root works regardless of cwd)
+    _repo_root = Path(__file__).resolve().parent.parent
+    _examples_dir = _repo_root / "examples" / "imgs" / config["example_name"]
+    config["examples_dir"] = str(_examples_dir.resolve())
+    config["sky_image_dir"] = str(_examples_dir.resolve())
+    if "runs_dir" in config and not Path(config["runs_dir"]).is_absolute():
+        config["runs_dir"] = str((_repo_root / config["runs_dir"]).resolve())
+    if "work_dir" in config and not Path(config["work_dir"]).is_absolute():
+        config["work_dir"] = str((_repo_root / config["work_dir"]).resolve())
+
+    print(
+        "###### ------------------ Keyframe (the major part of point clouds) generation ------------------ ######"
+    )
+    kf_gen = KeyframeGen(
+        config=config,
+        inpainter_pipeline=inpainter_pipeline,
+        mask_generator=mask_generator,
+        depth_model=depth_model,
+        segment_model=segment_model,
+        segment_processor=segment_processor,
+        normal_estimator=normal_estimator,
+        rotation_path=rotation_path,
+        inpainting_resolution=config["inpainting_resolution_gen"],
+        mvdiffusion=mvdiffusion,
+        sam_model=None,
+        dt_string=dt_string,
+    ).to(config["device"])
+
+    content_prompt = config.get("content_prompt", "")
+    style_prompt = config.get("style_prompt", "DSLR 35mm landscape")
+    adaptive_negative_prompt = config.get("negative_prompt", "")
+    background_prompt = config.get("background", None)
+    control_text = config.get("control_text", None)
+    outdoor = config.get("outdoor", False)
+    if adaptive_negative_prompt != "":
+        adaptive_negative_prompt += ", "
+
+    # Resolve image path: config image_filepath, or data_path/example_name/input_image
+    if config.get("image_filepath"):
+        _img_path = Path(config["image_filepath"])
+    else:
+        _img_path = Path(config.get("data_path", "examples/imgs")) / config["example_name"] / config.get("input_image", "image.png")
+    if not _img_path.is_absolute():
+        _img_path = (_repo_root / _img_path).resolve()
+    if not _img_path.exists():
+        raise FileNotFoundError(f"Input image not found: {_img_path}")
+    start_keyframe = Image.open(str(_img_path)).convert("RGB")
+    start_keyframe = crop_to_square(start_keyframe)
+    start_keyframe = start_keyframe.resize((512, 512))
+    kf_gen.image_latest = ToTensor()(start_keyframe).unsqueeze(0).to(config["device"])
+
+    syncdiffusion_model = SyncDiffusion(config['device'], sd_version='2.0-inpaint')
+    # syncdiffusion_model = None
+
+    # always check if sky image and sky pointcloud are existed or not, if not then generate
+    example_name = config["example_name"]
+
+    '''
+    if exist an in-painted image, use that for sky mask for sky generation, should generally be better
+    if the objects occluded the sky, we should use the in-painted image for sky mask
+    if the objects occluded other layers, the in-painted image doesn't effect the sky mask
+    '''
+    _base_layer_path = Path(config["examples_dir"]) / f"{example_name}_base_layer.png"
+    if _base_layer_path.exists():
+        for_sky_image = Image.open(str(_base_layer_path)).convert("RGB")
+        for_sky_image = crop_to_square(for_sky_image)
+        for_sky_image = for_sky_image.resize((512, 512))
+        for_sky_image = ToTensor()(for_sky_image).unsqueeze(0).to(config["device"])
+        sky_mask = kf_gen.generate_sky_mask(input_image = for_sky_image).float()
+    else:
+        sky_mask = kf_gen.generate_sky_mask().float()
+        for_sky_image = kf_gen.image_latest
+
+    _sky_dir = Path(config["sky_image_dir"])
+    if not (_sky_dir / "sky_0.png").exists():
+        config["gen_sky_image"] = True
+    else:
+        config["gen_sky_image"] = False
+
+    if not (_sky_dir / "finished_3dgs_sky_tanh.ply").exists():
+        config["gen_sky"] = True
+    else:
+        config["gen_sky"] = False
+
+    kf_gen.generate_sky_pointcloud( # the image is actually not used here, just the sky_mask
+        syncdiffusion_model,
+        image=for_sky_image,
+        mask=sky_mask,
+        gen_sky=config["gen_sky_image"],
+        style=style_prompt,
+    )
+
+    kf_gen.recompose_image_latest_and_set_current_pc()
+
+    content_list = content_prompt.split(",")
+    scene_name = content_list[0]
+    entities = content_list[1:]
+    scene_dict = {
+        "scene_name": scene_name,
+        "entities": entities,
+        "style": style_prompt,
+        "background": background_prompt,
+    }
+    inpainting_prompt = content_prompt
+
+    kf_gen.increment_kf_idx()
+    ###### ------------------ Main loop ------------------ ######
+
+    sky_example = config["example_name"]
+    config["gen_sky"] = True
+    if config["gen_sky"]:
+        traindatas = kf_gen.convert_to_3dgs_traindata(
+            xyz_scale=xyz_scale, remove_threshold=None, use_no_loss_mask=False
+        )
+        if config["gen_layer"]:
+            traindata, traindata_sky, traindata_layer = traindatas
+        else:
+            traindata, traindata_sky = traindatas
+        gaussians = GaussianModel(sh_degree=0, floater_dist2_threshold=9e9)
+        opt = GSParams()
+        opt.max_screen_size = (
+            100  # Sky is supposed to be big; set a high max screen size
+        )
+        opt.scene_extent = 1.5  # Sky is supposed to be big; set a high scene extent
+        opt.densify_from_iter = 200  # Need to do some densify
+        opt.prune_from_iter = 200  # Don't prune for sky because sky 3DGS are supposed to be big; prevent it by setting a high prune iter
+        opt.densify_grad_threshold = (
+            1.0  # Do not need to densify; Set a high threshold to prevent densifying
+        )
+        opt.iterations = 399  # More iterations than 100 needed for sky
+        scene = Scene(traindata_sky, gaussians, opt, is_sky=True)
+        dt_string = datetime.now().strftime("%d-%m_%H-%M-%S")
+        save_dir = Path(config["runs_dir"]) / f"{dt_string}_gaussian_scene_sky"
+        train_gaussian(gaussians, scene, opt, save_dir, initialize_scaling=False)
+        gaussians.save_ply_with_filter(
+            str(Path(config["sky_image_dir"]) / "finished_3dgs_sky_tanh.ply")
+        )
+    else:
+        gaussians = GaussianModel(sh_degree=0)
+        gaussians.load_ply_with_filter(
+            str(Path(config["sky_image_dir"]) / "finished_3dgs_sky_tanh.ply")
+        )  # pure sky
+
+    gaussians.visibility_filter_all = torch.zeros(
+        gaussians.get_xyz_all.shape[0], dtype=torch.bool, device="cuda"
+    )
+    gaussians.is_sky_filter = torch.ones(
+        gaussians.get_xyz_all.shape[0], dtype=torch.bool, device="cuda"
+    )
+    opt = GSParams()
+
+    particle_num_sky = gaussians.get_xyz_all.shape[0]
+    particle_num_base = 0
+    particle_num_object = 0
+
+    ### First scene 3DGS
+    if config["gen_layer"]:
+        # traindata, traindata_layer = kf_gen.convert_to_3dgs_traindata_latest_layer(xyz_scale=xyz_scale)
+        traindata_list, traindata_layer = (
+            kf_gen.convert_to_3dgs_traindata_list_latest_layer(xyz_scale=xyz_scale)
+        )
+
+        if isinstance(traindata_layer, list) and len(traindata_layer) == 2:
+            gaussians = GaussianModel(sh_degree=0, previous_gaussian=gaussians)
+            scene = Scene(traindata_layer[0], gaussians, opt)
+            dt_string = datetime.now().strftime("%d-%m_%H-%M-%S")
+            save_dir = Path(config["runs_dir"]) / f"{dt_string}_gaussian_scene_layer{0:02d}"
+            train_gaussian(gaussians, scene, opt, save_dir)  # Base layer training
+
+            gaussians = GaussianModel(sh_degree=0, previous_gaussian=gaussians)
+            scene = Scene(traindata_layer[1], gaussians, opt)
+            dt_string = datetime.now().strftime("%d-%m_%H-%M-%S")
+            save_dir = Path(config["runs_dir"]) / f"{dt_string}_gaussian_scene_layer{0:02d}"
+            train_gaussian(gaussians, scene, opt, save_dir)  # Base layer training
+
+            particle_num_base = gaussians.get_xyz_all.shape[0] - particle_num_sky
+
+            traindata_layer = traindata_layer[1]
+        else:
+            if traindata_layer['pcd_points'].shape[1] > 0:  # [3, N]
+                # some scenes, there are no points of base_layer
+                gaussians = GaussianModel(sh_degree=0, previous_gaussian=gaussians)
+                scene = Scene(traindata_layer, gaussians, opt)
+                dt_string = datetime.now().strftime("%d-%m_%H-%M-%S")
+                save_dir = Path(config["runs_dir"]) / f"{dt_string}_gaussian_scene_layer{0:02d}"
+                train_gaussian(gaussians, scene, opt, save_dir)  # Base layer training
+                particle_num_base = gaussians.get_xyz_all.shape[0] - particle_num_sky
+    else:
+        traindata_layer = kf_gen.convert_to_3dgs_traindata_latest(
+            xyz_scale=xyz_scale, use_no_loss_mask=False
+        )
+        traindata_layer.setdefault("ground_value", 0.0)
+        if traindata_layer["pcd_points"].shape[1] > 0:
+            gaussians = GaussianModel(sh_degree=0, previous_gaussian=gaussians)
+            scene = Scene(traindata_layer, gaussians, opt)
+            dt_string = datetime.now().strftime("%d-%m_%H-%M-%S")
+            save_dir = Path(config["runs_dir"]) / f"{dt_string}_gaussian_scene_layer{0:02d}"
+            train_gaussian(gaussians, scene, opt, save_dir)
+            particle_num_base = gaussians.get_xyz_all.shape[0] - particle_num_sky
+        traindata_list = []
+
+    # ---------- Environment motion early exit ----------
+    # For motion_type == "environment", we don't need object 3DGS training or the
+    # physics Simulator. The base + sky gaussians we already trained are enough
+    # to drive LivingWorld's HashGrid motion field. Skip everything below to
+    # avoid touching object-only code paths (empty _xyz, Simulator, bbox, ...).
+    motion_type = config.get("motion_type", "object")
+    if motion_type == "environment":
+        print("=" * 60)
+        print("Environment Motion (LivingWorld HashGrid) — skipping object training and physics")
+        print("=" * 60)
+        tdgs_cam = convert_pt3d_cam_to_3dgs_cam(
+            kf_gen.get_camera_at_origin(), xyz_scale=xyz_scale
+        )
+        gaussians.set_inscreen_points_to_visible(tdgs_cam)
+
+        save_dir_sim = kf_gen.run_dir / "simulation"
+        save_dir_sim.mkdir(parents=True, exist_ok=True)
+        save_dir_3d = kf_gen.run_dir / "3d_results"
+        save_dir_3d.mkdir(parents=True, exist_ok=True)
+        gaussians.save_ply_for_3dgs((save_dir_3d / "gaussians.ply").as_posix())
+
+        if "scene" not in locals():
+            scene = Scene(traindata_layer, gaussians, opt)
+
+        environment_motion_rendering(
+            gaussians, scene, save_dir_sim, config, video_gen_fps=8
+        )
+        print("Scene compositional reconstruction and environment motion finished.")
+        return
+    # ---------- End environment motion early exit ----------
+
+    gaussians = GaussianModel(sh_degree=0, previous_gaussian=gaussians)
+    i = 0
+    config["boundary_rules"] = {"y_min": traindata_layer["ground_value"]}
+
+    total_object_pts_num = 0
+    object_pts_num_list = []
+    gt_masks = []
+    faces = []
+    object_meshes_paths = []
+    object_meshes_translations = []
+
+    for train_data in traindata_list:
+        no_loss_mask = train_data["frames"][0]["no_loss_mask"]
+        gt_mask = 1.0 - no_loss_mask
+        gt_mask = gt_mask.cuda()
+        gt_masks.append(gt_mask)
+
+        scene = Scene(train_data, gaussians, opt, is_obj=True)
+        dt_string = datetime.now().strftime("%d-%m_%H-%M-%S")
+        save_dir = Path(config["runs_dir"]) / f"{dt_string}_gaussian_scene{i:02d}"
+        train_gaussian(
+            gaussians, scene, opt, save_dir, initialize_scaling=False, obj=True
+        )
+
+        object_pts_num = (
+            gaussians._tmp_get_xyz_all_separate()[0].shape[0] - total_object_pts_num
+        )
+        total_object_pts_num += object_pts_num
+        object_pts_num_list.append(object_pts_num)
+        faces.append(train_data["faces"])
+        object_meshes_paths.append(train_data["mesh_path"])
+        object_meshes_translations.append(train_data["mesh_translation"])
+        print(f"Object points number: {object_pts_num}")
+
+    # dt_string = datetime.now().strftime("%d-%m_%H-%M-%S")
+    # i = 0
+    # save_dir = Path(config['runs_dir']) / f"{dt_string}_gaussian_scene{i:02d}"
+
+    # # here train the boat gaussian
+    # train_gaussian(gaussians, scene, opt, save_dir, debug=True)
+
+    tdgs_cam = convert_pt3d_cam_to_3dgs_cam(
+        kf_gen.get_camera_at_origin(), xyz_scale=xyz_scale
+    )
+    gaussians.set_inscreen_points_to_visible(tdgs_cam)
+
+    particle_num_object = gaussians.get_xyz_all.shape[0] - particle_num_sky - particle_num_base
+
+    # here the boat gaussians are ready
+    save_dir_3d = kf_gen.run_dir / "3d_results"
+    save_dir_3d.mkdir(parents=True, exist_ok=True)
+    # sim = 'debug'
+    if sim is None:
+        xyz_obj, xyz_env = (
+            gaussians._tmp_get_xyz_all_separate()
+        )  # here xyz is boat, xyz_prev is all other
+        scaling_obj, scaling_env = gaussians._tmp_get_scaling_all_separate()
+        rotation_obj, rotation_env = gaussians._tmp_get_rotation_all_separate()
+        opacity_obj, opacity_env = gaussians._tmp_get_opacity_all_separate()
+        features_dc_obj, features_dc_env = gaussians._tmp_get_features_dc_all_separate()
+
+        xyz_max_obj = xyz_obj.max(dim=0)[0]
+        xyz_min_obj = xyz_obj.min(dim=0)[0]
+        y_mean = ((xyz_max_obj[1] + xyz_min_obj[1]) / 2).item()
+        z_mean = ((xyz_max_obj[2] + xyz_min_obj[2]) / 2).item()
+        x_mean = ((xyz_max_obj[0] + xyz_min_obj[0]) / 2).item()
+        x_left_point = x_mean + (xyz_max_obj[0] - x_mean).item() * 5.0
+        x_right_point = x_mean + (xyz_min_obj[0] - x_mean).item() * 5.0
+        print(f"x_left_point: {x_left_point}, x_right_point: {x_right_point}")
+        print(f"y_mean: {y_mean}, z_mean: {z_mean}")
+
+        object_infos = []
+        total_object_pts_num = 0
+        for iid in range(len(object_pts_num_list)):
+            object_infos.append(
+                {
+                    "xyz": xyz_obj.data.requires_grad_(False)[
+                        total_object_pts_num : total_object_pts_num
+                        + object_pts_num_list[iid]
+                    ],
+                    "rotation": rotation_obj.data.requires_grad_(False)[
+                        total_object_pts_num : total_object_pts_num
+                        + object_pts_num_list[iid]
+                    ],
+                    "scaling": scaling_obj.data.requires_grad_(False)[
+                        total_object_pts_num : total_object_pts_num
+                        + object_pts_num_list[iid]
+                    ],
+                    "features_dc": features_dc_obj.data.requires_grad_(False)[
+                        total_object_pts_num : total_object_pts_num
+                        + object_pts_num_list[iid]
+                    ],
+                    "opacity": opacity_obj.data.requires_grad_(False)[
+                        total_object_pts_num : total_object_pts_num
+                        + object_pts_num_list[iid]
+                    ],
+                    "faces": faces[iid],
+                    'mesh_path': object_meshes_paths[iid],
+                    'translation': object_meshes_translations[iid],
+                }
+            )
+            total_object_pts_num += object_pts_num_list[iid]
+
+        # duplicate the object info for the second object
+        # object_infos.append({
+        #     'xyz': xyz_obj.data.requires_grad_(False) + torch.tensor([-0.4, 0., 0], device=config['device']),
+        #     'rotation': rotation_obj.data.requires_grad_(False),
+        #     'scaling': scaling_obj.data.requires_grad_(False),
+        #     'features_dc': features_dc_obj.data.requires_grad_(False),
+        #     'opacity': opacity_obj.data.requires_grad_(False),
+        # })
+
+        simulation_steps = config["simulation_steps"]
+        dt = config["dt"]
+        video_gen_fps = 8
+        video_gen_dt = 1 / video_gen_fps
+        num_dt = int(video_gen_dt / dt)
+        simulation_steps = num_dt * simulation_steps
+
+        if simulation_steps < 1500:
+            simulation_steps = 1500
+        simulation_steps = 1000
+
+        save_dir_sim = kf_gen.run_dir / "simulation"
+        save_dir_sim.mkdir(parents=True, exist_ok=True)
+
+        # setup simulation
+        sim = Simulator(
+            config=config,
+            obj_gaussians=object_infos,
+            env_gaussians={
+                "xyz": xyz_env.data.requires_grad_(False),
+                "rotation": rotation_env.data.requires_grad_(False),
+                "scaling": scaling_env.data.requires_grad_(False),
+                "features_dc": features_dc_env.data.requires_grad_(False),
+                "opacity": opacity_env.data.requires_grad_(False),
+            },
+            delta_time=dt,
+            save_dir=save_dir_sim,
+        )
+
+        print("SAVING 3D RESULTS")
+        save_dir_3d = kf_gen.run_dir / "3d_results"
+        save_dir_3d.mkdir(parents=True, exist_ok=True)
+
+        input_view_R = tdgs_cam.R.reshape(-1).tolist()
+        input_view_T = tdgs_cam.T.reshape(-1).tolist()
+        bbox_min = sim.obj_valid_min.reshape(-1).tolist()
+        bbox_max = sim.obj_valid_max.reshape(-1).tolist()
+        save_info = {
+            "particle_num_object": particle_num_object,
+            "particle_num_base": particle_num_base,
+            "particle_num_sky": particle_num_sky,
+            "width": 512,
+            "height": 512,
+            "position": input_view_T,
+            "rotation": input_view_R,
+            "fy": tdgs_cam.focal_y,
+            "fx": tdgs_cam.focal_x,
+            "bbox_min": bbox_min,
+            "bbox_max": bbox_max,
+        }
+
+        for tmp_id in range(len(object_pts_num_list)):
+            save_info.update({f"obj_{tmp_id:04d}": object_pts_num_list[tmp_id]})
+        
+        save_info.update({'material_types': list(config['material_types'])})
+        
+        gaussians.save_ply_for_3dgs((save_dir_3d / "gaussians.ply").as_posix())
+        with open((save_dir_3d / "info.json").as_posix(), "w") as f:
+            json.dump(save_info, f, indent=4)
+        f.close()
+        # train_simulation(sim, scene, save_dir_sim)
+
+        # ========== Motion Type Branch ==========
+        motion_type = config.get('motion_type', 'object')
+
+        if motion_type == "environment":
+            print("=" * 60)
+            print("Environment Motion (LivingWorld HashGrid)")
+            print("=" * 60)
+
+            # Call environment motion function
+            environment_motion_rendering(gaussians, scene, save_dir_sim, config, video_gen_fps)
+        else:
+            print("=" * 60)
+            print("Object Motion (WonderPlay Genesis)")
+            print("=" * 60)
+
+            # Original WonderPlay physics simulation
+            simulation_efficient(sim, scene, save_dir_sim, config, gt_masks, object_pts_num_list, simulation_steps, video_gen_fps)
+
+    print("Scene compositional reconstruction and simulation finished.")
+
+
+def simulation_efficient(simulator, scene, save_dir, config, gt_masks, object_pts_num_list, simulation_steps, video_gen_fps):
+    global iter_number, kf_gen, gaussians, opt, background, view_matrix_wonder
+    global movement
+
+    """
+    No training of simulation, just simulate N steps, render each step once it's finished so less memory consumption
+    """
+
+    if "text_prompt" not in config:
+        print("No text prompt in config, using a void text prompt for now, please add it in the text_prompt.txt later")
+        text_prompt = " "
+    else:
+        text_prompt = config["text_prompt"]
+
+    with open((save_dir / "text_prompt.txt").as_posix(), "w") as f:
+        f.write(text_prompt)
+    f.close()
+
+    viewpoint_stack = scene.getTrainCameras().copy()
+    viewpoint_cam = viewpoint_stack[0]
+    gt_image = viewpoint_cam.original_image.cuda()
+    ToPILImage()(gt_image).save(save_dir / f"gt.png")
+
+    # object id mask for drag anything
+    if 'drag_anything_object' not in config:
+        print("No specific object id for drag anything, using the first object")
+        da_id = 0
+    else:
+        print(f"Using object id {config['drag_anything_object']} for drag anything")
+        da_id = config['drag_anything_object']
+
+    # Single fixed camera (no movement) - only first trajectory
+    number_traj = 1
+
+    # for the gaussian renderings, we'll have outputs in:
+    # frames / masks / depths / flows / flows_actual / flows_arrows for different camera trajectories
+    save_infos = dict()
+    save_kwargs = [
+        "frames",
+        "masks",
+        "depths",
+        "flows",
+        "flows_actual",
+        "flows_arrows",
+    ]
+    for tid in range(number_traj):
+        save_traj_dir = save_dir / f"traj_{tid:02d}"
+        save_traj_dir.mkdir(parents=True, exist_ok=True)
+
+        traj_save_infos = dict()
+
+        for save_name in save_kwargs:
+            (save_traj_dir / save_name).mkdir(parents=True, exist_ok=True)
+            traj_save_infos.update({
+                save_name: {
+                    "path": save_traj_dir / save_name,
+                    "data": []
+                }
+            })
+        
+        save_infos.update({
+            f"traj_{tid:02d}": traj_save_infos,
+            f"traj_{tid:02d}_dir": save_traj_dir
+        })
+
+    save_genesis_subdir = save_dir / "genesis"
+    save_genesis_subdir.mkdir(parents=True, exist_ok=True)
+
+    save_4d_subdir = save_dir / "4d"
+    save_4d_subdir.mkdir(parents=True, exist_ok=True)
+
+    render_videos = []
+    render_cv2 = []
+    render_masks = []
+    render_videos_side = []
+    render_depths = []
+    render_flows = []
+    render_flows_arrows = []
+    # mask for foreground
+    # foreground_num = gaussians._opacity.shape[0] * len(list(sim_out[0].keys()))
+    foreground_num = gaussians._opacity.shape[0]
+    background_num = gaussians._opacity_prev.shape[0]
+    render_mask = torch.zeros(foreground_num + background_num).to(config["device"])
+    render_mask[:foreground_num] = 1
+    render_mask = render_mask.bool()
+
+    prev_sim_out_step = None
+    prev_sim_out_step_cams = [None for _ in range(number_traj)]
+
+    force_function_config = config["force_function"]
+    force_function_module, force_function_func_name = force_function_config.rsplit(
+        ".", 1
+    )
+    force_function_module = importlib.import_module(force_function_module)
+    force_function = getattr(force_function_module, force_function_func_name)
+
+    # gaussian_vis_freq = num_dt
+    # gaussian_vis_freq = 50
+    gaussian_vis_freq = 20
+
+    for sid in tqdm(range(simulation_steps)):
+        sim_out = simulator.simulate_step(sid, simulation_steps, save_genesis_subdir, gaussian_vis_freq)
+
+        if sid % gaussian_vis_freq == 0:
+            # in num_dt steps, record the output frame information
+            sim_out_step = sim_out
+            tid = 0  # single fixed camera (no movement)
+            # fixed camera at origin
+            x_value, y_value, z_value = 0.0, 0.0, 0.0
+            view_matrix_wonder_here = [
+                -1, 0, 0, 0,
+                0, -1, 0, 0,
+                0, 0, 1, 0,
+                -x_value, -y_value, z_value, 1,
+            ]
+
+            tdgs_cam_noisy = convert_pt3d_cam_to_3dgs_cam(
+                kf_gen.get_camera_by_js_view_matrix(
+                    view_matrix_wonder_here, xyz_scale=xyz_scale
+                ),
+                xyz_scale=xyz_scale,
+            )
+
+            # save the camera trajectory sequence in the corresponding folder
+            cam_save_path = save_dir / f"traj_{tid:02d}" / "cams"
+            if not os.path.exists(cam_save_path.as_posix()):
+                cam_save_path.mkdir(parents=True, exist_ok=True)
+            cam_info_save_path = cam_save_path / f"frame_{sid:08d}.txt"
+            if isinstance(view_matrix_wonder_here, np.ndarray):
+                view_matrix_wonder_here = view_matrix_wonder_here.tolist()
+            np.savetxt(cam_info_save_path.as_posix(), view_matrix_wonder_here + [xyz_scale])
+
+            # save the simulated xyz sequence once per step
+            simulated_xyz = dict()
+            for obj_name in sim_out_step.keys():
+                simulated_xyz[obj_name] = sim_out_step[obj_name]["xyz"].detach().cpu().numpy()
+            np.savez(save_4d_subdir / f"simulated_xyz_{sid:08d}.npz", **simulated_xyz)
+
+            if prev_sim_out_step is None:
+                prev_sim_out_step = {k: {kk: vv.clone().detach() for kk, vv in v.items()} for k, v in sim_out_step.items()}
+            if prev_sim_out_step_cams[tid] is None:
+                prev_sim_out_step_cams[tid] = tdgs_cam_noisy
+
+            with torch.no_grad():
+                render_pkg = render_w_shift_flow(
+                    tdgs_cam_noisy,
+                    sim_out_step,
+                    gaussians,
+                    opt,
+                    background,
+                    render_visible=True,
+                    object_pts_num_list=object_pts_num_list,
+                    prev_step=prev_sim_out_step,
+                    prev_step_cam=prev_sim_out_step_cams[tid],
+                )
+                render_pkg_foreground = render_w_shift(
+                    tdgs_cam_noisy,
+                    sim_out_step,
+                    gaussians,
+                    opt,
+                    background,
+                    render_visible=True,
+                    render_mask=render_mask,
+                    object_pts_num_list=object_pts_num_list,
+                )
+                num_objects = len(sim_out_step.keys())
+                render_mask_da = []
+                for obj_id in range(num_objects):
+                    obj_pts_num = sim_out_step[f"obj_{obj_id:04d}"]["xyz"].shape[0]
+                    if obj_id == da_id:
+                        render_mask_da_this = torch.ones(obj_pts_num).to(config["device"])
+                    else:
+                        render_mask_da_this = torch.zeros(obj_pts_num).to(config["device"])
+                    render_mask_da.append(render_mask_da_this)
+                render_mask_da.append(torch.zeros(background_num).to(config["device"]))
+                render_mask_da = torch.cat(render_mask_da, dim=0)
+                render_mask_da = render_mask_da.bool()
+                render_pkg_da = render_w_shift_da(
+                    tdgs_cam_noisy,
+                    sim_out_step,
+                    gaussians,
+                    opt,
+                    background,
+                    render_visible=True,
+                    render_mask=render_mask_da,
+                    object_pts_num_list=object_pts_num_list,
+                )
+                # render masks for each object
+                for obj_id in range(num_objects):
+                    obj_pts_num = sim_out_step[f"obj_{obj_id:04d}"]["xyz"].shape[0]
+                    render_mask_obj_this = []
+                    for obj_id_this in range(num_objects):
+                        if obj_id_this == obj_id:
+                            render_mask_obj_this.append(torch.ones(obj_pts_num).to(config["device"]))
+                        else:
+                            render_mask_obj_this.append(torch.zeros(obj_pts_num).to(config["device"]))
+                    render_mask_obj_this.append(torch.zeros(background_num).to(config["device"]))
+                    render_mask_obj_this = torch.cat(render_mask_obj_this, dim=0)
+                    render_mask_obj_this = render_mask_obj_this.bool()
+                    render_pkg_obj = render_w_shift_da(
+                        tdgs_cam_noisy,
+                        sim_out_step,
+                        gaussians,
+                        opt,
+                        background,
+                        render_visible=True,
+                        render_mask=render_mask_obj_this,
+                        object_pts_num_list=object_pts_num_list,
+                    )
+                    mask_obj = render_pkg_obj["final_opacity"]
+                    mask_obj = mask_obj.detach().cpu().permute(1, 2, 0).numpy()
+                    mask_obj = (mask_obj > 0.).astype(np.uint8) * 255
+                    mask_obj_path = save_infos[f"traj_{tid:02d}"]["masks"]["path"].as_posix()
+                    mask_obj_path = mask_obj_path.replace("masks", f"masks_obj_{obj_id:04d}")
+                    os.makedirs(mask_obj_path, exist_ok=True)
+                    cv2.imwrite(
+                        os.path.join(mask_obj_path, f"frame_{sid:08d}.png"), mask_obj
+                    )
+
+            # frame output
+            image = render_pkg["render"]
+            image_pil = ToPILImage()(image)
+            image_pil.save((save_infos[f"traj_{tid:02d}"]["frames"]["path"] / f"frame_{sid:08d}.png").as_posix())
+            save_infos[f"traj_{tid:02d}"]["frames"]["data"].append(image_pil)
+            foreground_mask = render_pkg_foreground["final_opacity"]
+            foreground_mask = foreground_mask.detach().cpu().permute(1, 2, 0).numpy()
+            foreground_mask = (foreground_mask > 0.5).astype(np.uint8) * 255
+            cv2.imwrite(
+                (save_infos[f"traj_{tid:02d}"]["masks"]["path"] / f"frame_{sid:08d}.png").as_posix(), foreground_mask
+            )
+            save_infos[f"traj_{tid:02d}"]["masks"]["data"].append(foreground_mask)
+            foreground_mask_da = render_pkg_da["final_opacity"]
+            foreground_mask_da = foreground_mask_da.detach().cpu().permute(1, 2, 0).numpy()
+            foreground_mask_da = (foreground_mask_da > 0.5).astype(np.uint8) * 255
+            masks_da_path = save_infos[f"traj_{tid:02d}"]["masks"]["path"].as_posix()
+            masks_da_path = masks_da_path.replace("masks", "masks_da")
+            os.makedirs(masks_da_path, exist_ok=True)
+            cv2.imwrite(
+                os.path.join(masks_da_path, f"frame_{sid:08d}.png"), foreground_mask_da
+            )
+            depth = render_pkg["depth"]
+            save_infos[f"traj_{tid:02d}"]["depths"]["data"].append(depth.cpu().numpy())
+            depth_pil = ToPILImage()(depth)
+            depth_pil.save((save_infos[f"traj_{tid:02d}"]["depths"]["path"] / f"depth_{sid:08d}.png").as_posix())
+            flow = render_pkg["optical_flow"]
+            flow = flow[:2, :, :]
+            flow_actual = flow / 512.0
+            flow_actual = (1 + flow_actual) * 0.5
+            flow_actual = flow_actual.clamp(0, 1).detach().cpu().numpy()
+            np.save((save_infos[f"traj_{tid:02d}"]["flows_actual"]["path"] / f"flow_{sid:08d}.npy").as_posix(), flow_actual)
+            flow_arrows = visualize_flow_as_arrows(flow, image)
+            save_infos[f"traj_{tid:02d}"]["flows_arrows"]["data"].append(flow_arrows)
+            flow_frame = flow_to_image(flow)
+            flow_pil = ToPILImage()(flow_frame)
+            flow_pil.save((save_infos[f"traj_{tid:02d}"]["flows"]["path"] / f"flow_{sid:08d}.png").as_posix())
+            save_infos[f"traj_{tid:02d}"]["flows"]["data"].append(flow)
+
+            if sid == 0:
+                first_frame_image = image.clone().detach()
+                ToPILImage()(first_frame_image).save(save_dir / f"first_frame.png")
+                all_object_masks = torch.zeros_like(gt_masks[0]).bool()
+                for i in range(len(gt_masks)):
+                    all_object_masks = torch.logical_or(
+                        all_object_masks, gt_masks[i].bool()
+                    )
+                all_object_masks = all_object_masks.int()
+                compose_image = gt_image * all_object_masks + image * (
+                    1 - all_object_masks
+                )
+                ToPILImage()(compose_image).save(save_dir / f"compose_first_frame.png")
+
+            del render_pkg
+            del render_pkg_foreground
+            prev_sim_out_step_cams[tid] = tdgs_cam_noisy
+
+            del prev_sim_out_step
+            prev_sim_out_step = {k: {kk: vv.clone().detach() for kk, vv in v.items()} for k, v in sim_out_step.items()}
+            del sim_out_step
+
+            if len(save_infos["traj_00"]["frames"]["data"]) == 50:
+                break
+    
+    # Save masks as video
+    genesis_images = sorted(list(save_genesis_subdir.glob("*_[0-9][0-9][0-9][0-9].png")))
+    if len(genesis_images) > 0:
+        genesis_frames = []
+        for genesis_image in genesis_images:
+            genesis_frame = cv2.imread(str(genesis_image))
+            genesis_frames.append(genesis_frame)
+        imageio.mimsave(
+            (save_dir / "genesis_video.mp4").as_posix(),
+            genesis_frames,
+            fps=video_gen_fps
+        )
+    
+    for tid in range(number_traj):
+        traj_save_infos = save_infos[f"traj_{tid:02d}"]
+        traj_save_dir = save_infos[f"traj_{tid:02d}_dir"]
+
+        render_videos = traj_save_infos["frames"]["data"]
+        render_masks = traj_save_infos["masks"]["data"]
+        render_depths = traj_save_infos["depths"]["data"]
+        render_flows = traj_save_infos["flows"]["data"]
+        render_flows_arrows = traj_save_infos["flows_arrows"]["data"]
+    
+        render_videos[0].save(
+            (traj_save_dir / "render_video.gif").as_posix(),
+            save_all=True,
+            append_images=render_videos[1:],
+            fps=video_gen_fps,
+            loop=0,
+        )
+        imageio.mimsave(
+            (traj_save_dir / "render_video.mp4").as_posix(), render_videos, fps=video_gen_fps
+        )
+
+        render_depths = np.concatenate(render_depths, axis=0) # [T, H, W]
+        render_depths = torch.from_numpy(render_depths).float().cuda()
+        render_depths_min = render_depths.min()
+        render_depths_max = render_depths.max()
+        render_depths = (render_depths - render_depths_min) ** 2 / (render_depths_max - render_depths_min) ** 2
+        render_depths = [ToPILImage()(1 - depth) for depth in render_depths]
+        imageio.mimsave(
+            (traj_save_dir / "render_depths.mp4").as_posix(), render_depths, fps=video_gen_fps
+        )
+        (traj_save_dir / "depths_compose").mkdir(parents=True, exist_ok=True)
+        for i in range(len(render_depths)):
+            render_depths[i].save((traj_save_dir / "depths_compose" / f"frame_{i:08d}.png").as_posix())
+
+        render_flows = torch.stack(render_flows, dim=0)
+        render_flows = flow_to_image(render_flows)
+        render_flows = [ToPILImage()(flow) for flow in render_flows]
+        imageio.mimsave(
+            (traj_save_dir / "render_flows.mp4").as_posix(), render_flows, fps=video_gen_fps
+        )
+        (traj_save_dir / "flows_compose").mkdir(parents=True, exist_ok=True)
+        for i in range(len(render_flows)):
+            render_flows[i].save((traj_save_dir / "flows_compose" / f"frame_{i:08d}.png").as_posix())
+    
+        render_flows_arrows = torch.stack(render_flows_arrows, dim=0)
+        render_flows_arrows = [ToPILImage()(flow_arrow) for flow_arrow in render_flows_arrows]
+        imageio.mimsave(
+            (traj_save_dir / "render_flows_arrows.mp4").as_posix(), render_flows_arrows, fps=video_gen_fps
+        )
+        (traj_save_dir / "flows_arrows").mkdir(parents=True, exist_ok=True)
+        for i in range(len(render_flows_arrows)):
+            render_flows_arrows[i].save((traj_save_dir / "flows_arrows" / f"frame_{i:08d}.png").as_posix())
+        
+    # simulator.init_simulation_list()
+    print("simulation efficient finish")
+    return None
+
+
+def train_gaussian(
+    gaussians: GaussianModel,
+    scene: Scene,
+    opt: GSParams,
+    save_dir: Path,
+    initialize_scaling=True,
+    obj=False,
+):
+    global iter_number, view_matrix, already_object_pts_num
+    iterable_gauss = range(1, opt.iterations + 1)
+    trainCameras = scene.getTrainCameras().copy()
+    gaussians.compute_3D_filter(
+        cameras=trainCameras, initialize_scaling=initialize_scaling
+    )
+
+    if obj:
+        opt.densify_from_iter = opt.iterations + 10
+        iterable_gauss = range(0, 1)  # TODO: debug how to use mask supervision
+
+    for iteration in iterable_gauss:
+        # Pick a random Camera
+        viewpoint_stack = scene.getTrainCameras().copy()
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+
+        # import pdb; pdb.set_trace()
+        # Render
+        render_pkg = render(viewpoint_cam, gaussians, opt, background)
+        image, viewspace_point_tensor, visibility_filter, radii = (
+            render_pkg["render"],
+            render_pkg["viewspace_points"],
+            render_pkg["visibility_filter"],
+            render_pkg["radii"],
+        )
+
+        # Loss
+        gt_image = viewpoint_cam.original_image.cuda()
+
+        # if iteration % 1000 == 0 or iteration == opt.iterations:
+        #     ToPILImage()(image).save(save_dir / f'it{iteration:04d}_rendered.png')
+        #     ToPILImage()(gt_image).save(save_dir / f'it{iteration:04d}_gt.png')
+
+        if obj:
+            no_loss_mask = scene.traindata["frames"][0]["no_loss_mask"]
+            # no_loss_mask = None
+            gt_mask = 1.0 - no_loss_mask
+            gt_mask = gt_mask.cuda()
+
+            n_trainable = scene.traindata["pcd_points"].shape[0]
+            n_all = viewspace_point_tensor.shape[0]
+            foreground_mask = torch.zeros(n_all).to(config["device"])
+            foreground_mask[
+                already_object_pts_num : (already_object_pts_num + n_trainable)
+            ] = 1
+            foreground_mask = foreground_mask.bool()
+
+            render_foreground_pkg = render(
+                viewpoint_cam, gaussians, opt, background, render_mask=foreground_mask
+            )
+            output_mask = render_foreground_pkg["final_opacity"]
+
+            loss = ((output_mask - gt_mask) ** 2).mean()
+        else:
+            no_loss_mask = None
+
+            Ll1 = l1_loss(image, gt_image, no_loss_mask=no_loss_mask)
+
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (
+                1.0 - ssim(image, gt_image, no_loss_mask=no_loss_mask)
+            )
+        if iteration == opt.iterations:
+            # if iteration % 5 == 0 or iteration == 1:
+            time.sleep(0.1)
+            print(f"Iteration {iteration}, Loss: {loss.item()}")
+            with torch.no_grad():
+                tdgs_cam = convert_pt3d_cam_to_3dgs_cam(
+                    kf_gen.get_camera_by_js_view_matrix(
+                        view_matrix, xyz_scale=xyz_scale
+                    ),
+                    xyz_scale=xyz_scale,
+                )
+                render_pkg = render(tdgs_cam, gaussians, opt, background)
+                image = render_pkg["render"]
+            # (optional: could save debug render here)
+        loss.backward()
+        if iteration == opt.iterations:
+            print(f"Final loss: {loss.item()}")
+
+        if not obj:
+            # Use variables that related to the trainable GS
+            n_trainable = gaussians.get_xyz.shape[0]
+            viewspace_point_tensor_grad, visibility_filter, radii = (
+                viewspace_point_tensor.grad[:n_trainable],
+                visibility_filter[:n_trainable],
+                radii[:n_trainable],
+            )
+
+            with torch.no_grad():
+                # Densification
+                if iteration < opt.densify_until_iter:
+                    # Keep track of max radii in image-space for pruning
+                    gaussians.max_radii2D[visibility_filter] = torch.max(
+                        gaussians.max_radii2D[visibility_filter],
+                        radii[visibility_filter],
+                    )
+                    gaussians.add_densification_stats(
+                        viewspace_point_tensor_grad, visibility_filter
+                    )
+
+                    if (
+                        iteration >= opt.densify_from_iter
+                        and iteration % opt.densification_interval == 0
+                    ):
+                        max_screen_size = (
+                            opt.max_screen_size
+                            if iteration >= opt.prune_from_iter
+                            else None
+                        )
+                        camera_height = 0.0003 * xyz_scale
+                        scene_extent = (
+                            camera_height * 2
+                            if opt.scene_extent is None
+                            else opt.scene_extent
+                        )
+                        opacity_lowest = 0.05
+                        gaussians.densify_and_prune(
+                            opt.densify_grad_threshold,
+                            opacity_lowest,
+                            scene_extent,
+                            max_screen_size,
+                        )
+                        gaussians.compute_3D_filter(cameras=trainCameras)
+
+                    # if (iteration % opt.opacity_reset_interval == 0
+                    #     or (opt.white_background and iteration == opt.densify_from_iter)
+                    # ):
+                    #     gaussians.reset_opacity()
+
+                # if iteration % 100 == 0 and iteration > opt.densify_until_iter:
+                #     if iteration < opt.iterations - 100:
+                #         # don't update in the end of training
+                #         gaussians.compute_3D_filter(cameras=trainCameras)
+
+        else:
+            if iteration >= 80 and iteration % 100 == 0:
+                opacity_lowest = 0.05
+                prune_mask = (gaussians.get_opacity < opacity_lowest).squeeze()
+                gaussians.prune_points(prune_mask)
+                gaussians.compute_3D_filter(cameras=trainCameras)
+            pass
+        # Optimizer step
+        if iteration < opt.iterations:
+            gaussians.optimizer.step()
+            gaussians.optimizer.zero_grad(set_to_none=True)
+
+    if obj:
+        already_object_pts_num += n_trainable
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser(description="WonderPlay: scene compositional reconstruction and simulation")
+    parser.add_argument(
+        "--config",
+        default="examples/configs/venice.yaml",
+        help="Path to config YAML (default: examples/configs/venice.yaml)",
+    )
+    parser.add_argument(
+        "--prefix",
+        type=str,
+        default=None,
+        help="Optional string for run directory naming (overrides current time if provided).",
+    )
+    args = parser.parse_args()
+
+    # Resolve paths relative to repo root (parent of WonderPlay_new when running from there)
+    script_dir = Path(__file__).resolve().parent
+    repo_root = script_dir.parent
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = repo_root / config_path
+    base_config_path = repo_root / "examples" / "base-config.yaml"
+    if base_config_path.exists():
+        base_config = OmegaConf.load(str(base_config_path))
+        config = OmegaConf.merge(base_config, OmegaConf.load(str(config_path)))
+    else:
+        config = OmegaConf.load(str(config_path))
+
+    # Ensure required config keys with defaults for one-click venice run
+    OmegaConf.set_struct(config, False)
+    if "runs_dir" not in config:
+        config["runs_dir"] = config.get("work_dir", "3d_result/wonderplay/venice")
+    if "num_scenes" not in config:
+        config["num_scenes"] = 1
+    if "rotation_path" not in config:
+        config["rotation_path"] = [0]  # single scene
+    if "force_function" not in config and "force_function_name" in config:
+        config["force_function"] = f"simulator.genesis_functions.{config['force_function_name']}"
+    if "use_gpt" not in config:
+        config["use_gpt"] = False
+    if "debug" not in config:
+        config["debug"] = False
+    OmegaConf.set_struct(config, True)
+
+    run(config, dt_string=args.prefix)

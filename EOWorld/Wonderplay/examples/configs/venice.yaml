@@ -1,0 +1,107 @@
+# WonderPlay Configuration for venice scene (one-click run)
+scene_name: venice
+examples_dir: "examples/imgs/venice"
+sky_image_dir: "examples/imgs/venice"
+runs_dir: "3d_result/wonderplay/venice"
+work_dir: "3d_result/wonderplay/venice"
+data_path: "examples/imgs"
+example_name: "venice"
+
+seed: 1
+frames: 5
+device: cuda
+
+finetune_decoder_gen: False
+finetune_decoder_interp: False
+finetune_depth_model: True
+
+num_scenes: 16
+use_gpt: False
+kf2_upsample_coef: 4
+skip_interp: True
+skip_gen: False
+kfgen_load_dt_string: 04-03_01-13-24
+enable_regenerate: False
+
+debug: True
+inpainting_resolution_gen: 512
+stable_diffusion_checkpoint: "sd2-community/stable-diffusion-2-inpainting"
+inpainting_resolution_interp: 512
+negative_inpainting_prompt: "collage, text, writings, signs, text, white border, photograph border, artifacts, blur, blurry, foggy, fog, bad quality, distortions, distorted image, watermark, signature, fisheye look"
+
+rotation_path: [2, 2, 2, 2, 2, 2, 2, 2, -2, -2, -2, -2, -2, -2, -2, -2]
+camera_speed_multiplier_rotation: 0.3
+depth_model: marigold
+depth_model_indoor: False
+
+camera_speed: 0.001
+fg_depth_range: 0.015
+depth_shift: 0.001
+
+sky_hard_depth: 0.02
+gen_sky: False
+gen_layer: False
+
+refine_depth_conditioning: False
+
+rotation_range: 0.37
+init_focal_length: 970
+
+sky_example_name: venice_1
+foreground_ids: [76]
+ground_ids: []
+object_split_mask_sam_ids: []
+
+base_inpainting_prompt: 'river, water, sea, ocean, lake, pond'
+base_inpainting_negative_prompt: 'tree, plant, ship, boat'
+without_heuristic_set_depth_image: True
+imgto3D: False
+imgto3d_method: "instantmesh"
+imgto3d_fg_ratio: 0.85
+imgto3d_resolution: 128
+imgto3d_optimization_iters: 3500
+object_num: 1
+
+text_prompt: a boat on the river
+
+force_function_name: force_venice_1
+
+material_types: [
+  "rigid",
+]
+
+rigid_friction: 0.05
+rigid_coup_friction: 0.05
+rigid_coup_softness: 0.1
+
+collision_force_with_env: False
+collision_force_with_obj: False
+collision_constraint_with_env: True
+collision_constraint_with_obj: True
+
+simulation_iterations: 2
+simulation_steps: 50
+dt: 0.01
+
+boundary_rules: {y_min: -0.4}
+
+# ========== Motion Type Configuration ==========
+# "object": WonderPlay Genesis physics simulation (original)
+# "environment": LivingWorld HashGrid motion field (new)
+# 
+# motion_type: "object"
+motion_type: "environment"
+
+# Environment motion configuration (only used when motion_type="environment")
+environment_motion:
+  scale_factor: 3.0  # Motion strength (写死: 2.0)
+  sam_prompt: "water"  # Segmentation prompt (写死: "water")
+  # Fixed motion hints: [[start_x, start_y, end_x, end_y], ...]
+  # 根据 LivingWorld 交互产生的运动方向设置
+  # 三个运动方向箭头（从右上往左下的水流方向）
+  fixed_hints: [
+    [311, 361, 254, 403],  # 第一个箭头：从 (311, 361) 到 (254, 403)
+    [369, 382, 285, 451],  # 第二个箭头：从 (369, 382) 到 (285, 451)
+    [431, 401, 355, 472]   # 第三个箭头：从 (431, 401) 到 (355, 472)
+  ]
+
