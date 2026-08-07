@@ -1,0 +1,88 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments and local environment files
+.venv/
+venv/
+env/
+ENV/
+conda/
+.env
+.env.*
+
+# Jupyter / editor / OS noise
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and experiment trackers
+logs/
+**/logs/
+runs/
+**/runs/
+wandb/
+tensorboard/
+events.out.tfevents*
+
+# Temporary and generated outputs
+tmp/
+temp/
+cache/
+model_cache/
+outputs/
+output/
+results/
+3d_result/
+3d_result_/
+**/3d_result/
+**/3d_result_/
+tmp_mesh/
+snapshot_fw.dump
+
+# Model weights / checkpoints / downloaded model caches
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.onnx
+*.bin
+*.pkl
+*.pickle
+checkpoints/
+**/checkpoints/
+ckpts/
+**/ckpts/
+lora_models/
+**/lora_models/
+
+# Large generated arrays and render artifacts
+*.npy
+*.npz
+*.ply
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+
+# Local papers, scratch images, and generated project notes
+Wonderplay/2505.18151v2.pdf
+Wonderplay/sample_image.png
+Wonderplay/COMPLETION_FINAL.md
+Wonderplay/FINAL_SUMMARY.md
+Wonderplay/INTEGRATION_PLAN.md
+Wonderplay/INTEGRATION_PLAN_MINIMAL.md
+Wonderplay/INTEGRATION_SUMMARY.md
+Wonderplay/PROJECT_COMPLETE.md
+
+# Nested Git metadata should never be uploaded as files
+**/.git/
