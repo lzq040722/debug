@@ -174,103 +174,114 @@ def render_MLP(viewpoint_camera, pc, motion_model, t, opt, bg_color: torch.Tenso
         motion_mask = motion_mask[visibility_filter_all][:, 0].bool()
         motion_pts = means3D[motion_mask]
 
-        ax_len = torch.max(motion_pts, dim=0)[0] - torch.min(motion_pts, dim=0)[0]
+        if motion_pts.shape[0] == 0:
+            print("[render_MLP] WARNING: no motion points after filtering; rendering static frame")
+            means2D = means2D[visibility_filter_all]
+            shs = None if shs is None else shs[visibility_filter_all]
+            colors_precomp = None if colors_precomp is None else colors_precomp[visibility_filter_all]
+            opacity = opacity[visibility_filter_all]
+            scales = scales[visibility_filter_all]
+            rotations = rotations[visibility_filter_all]
+            cov3D_precomp = None if cov3D_precomp is None else cov3D_precomp[visibility_filter_all]
+            motion_model = None
+        else:
+            ax_len = torch.max(motion_pts, dim=0)[0] - torch.min(motion_pts, dim=0)[0]
 
-        smooth = (1.2 / T * torch.tensor([0.5,0.5,2.3], device=means3D.device)) * scale_factor
+            smooth = (1.2 / T * torch.tensor([0.5,0.5,2.3], device=means3D.device)) * scale_factor
 
-        torch.cuda.synchronize()
-        t0 = time.time()
-
-        cache_key = (
-            T,
-            float(scale_factor),
-            int(motion_pts.shape[0]),
-            float(smooth[0].item()), float(smooth[1].item()), float(smooth[2].item()),
-            float(motion_pts[:,0].mean().item()), float(motion_pts[:,1].mean().item()), float(motion_pts[:,2].mean().item()),
-            float(motion_pts[:,0].std().item()),  float(motion_pts[:,1].std().item()),  float(motion_pts[:,2].std().item()),
-        )
-
-        c = render_MLP._cache
-        if c["key"] != cache_key:
             torch.cuda.synchronize()
             t0 = time.time()
 
-            f_pos, b_pos = pre_euler_integral(motion_pts.detach(), motion_model, T+1, smooth)
+            cache_key = (
+                T,
+                float(scale_factor),
+                int(motion_pts.shape[0]),
+                float(smooth[0].item()), float(smooth[1].item()), float(smooth[2].item()),
+                float(motion_pts[:,0].mean().item()), float(motion_pts[:,1].mean().item()), float(motion_pts[:,2].mean().item()),
+                float(motion_pts[:,0].std().item()),  float(motion_pts[:,1].std().item()),  float(motion_pts[:,2].std().item()),
+            )
+
+            c = render_MLP._cache
+            if c["key"] != cache_key:
+                torch.cuda.synchronize()
+                t0 = time.time()
+
+                f_pos, b_pos = pre_euler_integral(motion_pts.detach(), motion_model, T+1, smooth)
+
+                torch.cuda.synchronize()
+                t1 = time.time()
+                print(f"[timing] pre_euler_integral (recompute) {(t1-t0)*1000:.2f} ms")
+
+                c["key"] = cache_key
+                c["f_pos"] = f_pos
+                c["b_pos"] = b_pos
+            else:
+                f_pos, b_pos = c["f_pos"], c["b_pos"]
 
             torch.cuda.synchronize()
             t1 = time.time()
-            print(f"[timing] pre_euler_integral (recompute) {(t1-t0)*1000:.2f} ms")
 
-            c["key"] = cache_key
-            c["f_pos"] = f_pos
-            c["b_pos"] = b_pos
-        else:
-            f_pos, b_pos = c["f_pos"], c["b_pos"]
+            b_idx = T - t if T is not None else t
+            pos_f = f_pos[t]
+            pos_b = b_pos[b_idx]
 
-        torch.cuda.synchronize()
-        t1 = time.time()
+            means3D_f = means3D.clone()
+            means3D_b = means3D.clone()
+            means3D_o = means3D.clone()
 
-        b_idx = T - t if T is not None else t
-        pos_f = f_pos[t]
-        pos_b = b_pos[b_idx]
+            moving_idx = motion_mask.nonzero(as_tuple=False).squeeze()
+            means3D_f[moving_idx] = pos_f
+            means3D_b[moving_idx] = pos_b
 
-        means3D_f = means3D.clone()
-        means3D_b = means3D.clone()
-        means3D_o = means3D.clone()
+            forward = means3D_f-means3D_o
+            backward = means3D_b-means3D_o
 
-        moving_idx = motion_mask.nonzero(as_tuple=False).squeeze()
-        means3D_f[moving_idx] = pos_f
-        means3D_b[moving_idx] = pos_b
+            alpha = t / T
 
-        forward = means3D_f-means3D_o
-        backward = means3D_b-means3D_o
+            w_f = 1 - alpha
+            w_b = alpha
 
-        alpha = t / T
+            opacity_base  = opacity[visibility_filter_all]
+            opacity = torch.cat([opacity_base * w_f, opacity_base * w_b], dim=0)
 
-        w_f = 1 - alpha
-        w_b = alpha
+            means3D = torch.cat([means3D_f, means3D_b], dim=0)
 
-        opacity_base  = opacity[visibility_filter_all]
-        opacity = torch.cat([opacity_base * w_f, opacity_base * w_b], dim=0)
+            means2D = dup(means2D[visibility_filter_all])
+            shs = dup(None if shs is None else shs[visibility_filter_all])
+            colors_precomp = dup(None if colors_precomp is None else colors_precomp[visibility_filter_all])
 
-        means3D = torch.cat([means3D_f, means3D_b], dim=0)
+            scales = dup(scales[visibility_filter_all])
+            rotations = dup(rotations[visibility_filter_all])
+            cov3D_precomp = dup(None if cov3D_precomp is None else cov3D_precomp[visibility_filter_all])
 
-        means2D = dup(means2D[visibility_filter_all])
-        shs = dup(None if shs is None else shs[visibility_filter_all])
-        colors_precomp = dup(None if colors_precomp is None else colors_precomp[visibility_filter_all])
+            _check(
+                ("means3D", means3D), ("means2D", means2D),
+                ("opacity", opacity), ("scales", scales),
+                ("rot", rotations), ("cov", cov3D_precomp),
+                ("shs", shs), ("colors", colors_precomp),
+            )
 
-        scales = dup(scales[visibility_filter_all])
-        rotations = dup(rotations[visibility_filter_all])
-        cov3D_precomp = dup(None if cov3D_precomp is None else cov3D_precomp[visibility_filter_all])
+            if flow_render:
+                flow2d_f = forward[:, :2].detach().cpu().numpy()
+                u_f = -flow2d_f[:, 0]
+                v_f = -flow2d_f[:, 1]
+                color_rgb_f = flow_uv_to_colors(u_f, v_f, convert_to_bgr=False)
+                color_rgb_f = (color_rgb_f / 255.0).astype(np.float32)
+                color_rgb_tensor_f = torch.from_numpy(color_rgb_f).to(scene_flow.device)
 
-        _check(
-            ("means3D", means3D), ("means2D", means2D),
-            ("opacity", opacity), ("scales", scales),
-            ("rot", rotations), ("cov", cov3D_precomp),
-            ("shs", shs), ("colors", colors_precomp),
-        )
+                zero_forward = color_rgb_tensor_f
 
-        if flow_render:
-            flow2d_f = forward[:, :2].detach().cpu().numpy()
-            u_f = -flow2d_f[:, 0]
-            v_f = -flow2d_f[:, 1]
-            color_rgb_f = flow_uv_to_colors(u_f, v_f, convert_to_bgr=False)
-            color_rgb_f = (color_rgb_f / 255.0).astype(np.float32)
-            color_rgb_tensor_f = torch.from_numpy(color_rgb_f).to(scene_flow.device)
+                flow2d_b = backward[:, :2].detach().cpu().numpy()
+                u_b = -flow2d_b[:, 0]
+                v_b = -flow2d_b[:, 1]
+                color_rgb_b = flow_uv_to_colors(u_b, v_b, convert_to_bgr=False)
+                color_rgb_b = (color_rgb_b / 255.0).astype(np.float32)
+                color_rgb_tensor_b = torch.from_numpy(color_rgb_b).to(scene_flow.device)
 
-            zero_forward = color_rgb_tensor_f
+                zero_backward = color_rgb_tensor_b
 
-            flow2d_b = backward[:, :2].detach().cpu().numpy()
-            u_b = -flow2d_b[:, 0]
-            v_b = -flow2d_b[:, 1]
-            color_rgb_b = flow_uv_to_colors(u_b, v_b, convert_to_bgr=False)
-            color_rgb_b = (color_rgb_b / 255.0).astype(np.float32)
-            color_rgb_tensor_b = torch.from_numpy(color_rgb_b).to(scene_flow.device)
-
-            zero_backward = color_rgb_tensor_b
-
-            color_rgb = torch.cat([zero_forward, zero_backward], dim=0)
-            colors_precomp = color_rgb
+                color_rgb = torch.cat([zero_forward, zero_backward], dim=0)
+                colors_precomp = color_rgb
 
     # WonderPlay rasterizer expects feats3D (Nx20) and delta (Nx3)
     # Create zero tensors to avoid illegal memory access in C++ kernel

@@ -119,6 +119,69 @@ class GaussianModel:
                 ),
                 dim=0,
             )
+            previous_scene_flow = getattr(
+                previous_gaussian,
+                "_scene_flow",
+                torch.zeros_like(previous_gaussian._xyz.detach()),
+            )
+            if previous_scene_flow.shape[0] != previous_gaussian._xyz.shape[0]:
+                previous_scene_flow = torch.zeros_like(previous_gaussian._xyz.detach())
+            previous_scene_flow_prev = getattr(
+                previous_gaussian,
+                "_scene_flow_prev",
+                torch.zeros_like(previous_gaussian._xyz_prev),
+            )
+            if previous_scene_flow_prev.shape[0] != previous_gaussian._xyz_prev.shape[0]:
+                previous_scene_flow_prev = torch.zeros_like(previous_gaussian._xyz_prev)
+            previous_motion_mask = getattr(
+                previous_gaussian,
+                "_motion_mask",
+                torch.zeros(
+                    previous_gaussian._xyz.shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device="cuda",
+                ),
+            )
+            if previous_motion_mask.shape[0] != previous_gaussian._xyz.shape[0]:
+                previous_motion_mask = torch.zeros(
+                    previous_gaussian._xyz.shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device="cuda",
+                )
+            if previous_motion_mask.ndim == 1:
+                previous_motion_mask = previous_motion_mask[:, None]
+            elif previous_motion_mask.shape[1] != 1:
+                previous_motion_mask = previous_motion_mask[:, :1]
+            previous_motion_mask_prev = getattr(
+                previous_gaussian,
+                "_motion_mask_prev",
+                torch.zeros(
+                    previous_gaussian._xyz_prev.shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device="cuda",
+                ),
+            )
+            if previous_motion_mask_prev.shape[0] != previous_gaussian._xyz_prev.shape[0]:
+                previous_motion_mask_prev = torch.zeros(
+                    previous_gaussian._xyz_prev.shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device="cuda",
+                )
+            if previous_motion_mask_prev.ndim == 1:
+                previous_motion_mask_prev = previous_motion_mask_prev[:, None]
+            elif previous_motion_mask_prev.shape[1] != 1:
+                previous_motion_mask_prev = previous_motion_mask_prev[:, :1]
+            self._scene_flow_prev = torch.cat(
+                [previous_scene_flow.detach(), previous_scene_flow_prev], dim=0
+            )
+            self._motion_mask_prev = torch.cat(
+                [previous_motion_mask.detach().bool(), previous_motion_mask_prev.bool()],
+                dim=0,
+            )
             self.visibility_filter_all = previous_gaussian.visibility_filter_all
             self.is_sky_filter = previous_gaussian.is_sky_filter
             self.delete_mask_all = previous_gaussian.delete_mask_all
@@ -129,9 +192,13 @@ class GaussianModel:
             self._rotation_prev = torch.empty(0).cuda()
             self._opacity_prev = torch.empty(0).cuda()
             self.filter_3D_prev = torch.empty(0).cuda()
+            self._scene_flow_prev = torch.empty((0, 3), device="cuda")
+            self._motion_mask_prev = torch.empty((0, 1), dtype=torch.bool, device="cuda")
             self.visibility_filter_all = torch.empty(0, dtype=torch.bool).cuda()
             self.is_sky_filter = torch.empty(0, dtype=torch.bool).cuda()
             self.delete_mask_all = torch.empty(0, dtype=torch.bool).cuda()
+        self._scene_flow = torch.empty((0, 3), device="cuda")
+        self._motion_mask = torch.empty((0, 1), dtype=torch.bool, device="cuda")
 
     def capture(self):
         return (
@@ -304,16 +371,20 @@ class GaussianModel:
     @property
     def get_scene_flow_all(self):
         """Scene flow for environment motion (LivingWorld)"""
-        if not hasattr(self, '_scene_flow_all'):
+        if hasattr(self, '_scene_flow_all'):
+            return self._scene_flow_all
+        if not hasattr(self, '_scene_flow'):
             return torch.zeros_like(self.get_xyz_all)
-        return self._scene_flow_all
+        return torch.cat([self._scene_flow, self._scene_flow_prev], dim=0)
 
     @property
     def get_motion_mask_all(self):
         """Motion mask for environment motion (LivingWorld)"""
-        if not hasattr(self, '_motion_mask_all'):
+        if hasattr(self, '_motion_mask_all'):
+            return self._motion_mask_all
+        if not hasattr(self, '_motion_mask'):
             return torch.zeros(self.get_xyz_all.shape[0], 1, dtype=torch.bool, device='cuda')
-        return self._motion_mask_all
+        return torch.cat([self._motion_mask, self._motion_mask_prev], dim=0)
 
     # ========== End LivingWorld Properties ==========
 
@@ -390,7 +461,16 @@ class GaussianModel:
             screen_normal_yoz = F.normalize(screen_normal[:, [1, 2]], dim=1)
             cos_yz = torch.sum(point_normals_in_screen_yoz * screen_normal_yoz, dim=1)
             # assert torch.all(cos_yz >= 0), "All normals should be in the same direction of the screen normal. Current min value: {}".format(cos_yz.min())
-        distance[~valid_points] = distance[valid_points].max()
+        if valid_points.any():
+            distance[~valid_points] = distance[valid_points].max()
+        else:
+            fallback_distance = torch.nan_to_num(z.detach().abs().median(), nan=1.0).clamp_min(1.0)
+            distance[:] = fallback_distance
+            focal_length = max(float(focal_length), float(cameras[0].focal_x), 1.0)
+            print(
+                "[compute_3D_filter] WARNING: no valid points for train camera; "
+                f"using fallback distance={fallback_distance.item():.6f}"
+            )
 
         # TODO remove hard coded value
         # TODO box to gaussian transform
@@ -480,7 +560,16 @@ class GaussianModel:
             screen_normal_yoz = F.normalize(screen_normal[:, [1, 2]], dim=1)
             cos_yz = torch.sum(point_normals_in_screen_yoz * screen_normal_yoz, dim=1)
             # assert torch.all(cos_yz >= 0), "All normals should be in the same direction of the screen normal. Current min value: {}".format(cos_yz.min())
-        distance[~valid_points] = distance[valid_points].max()
+        if valid_points.any():
+            distance[~valid_points] = distance[valid_points].max()
+        else:
+            fallback_distance = torch.nan_to_num(z.detach().abs().median(), nan=1.0).clamp_min(1.0)
+            distance[:] = fallback_distance
+            focal_length = max(float(focal_length), float(cameras[0].focal_x), 1.0)
+            print(
+                "[compute_3D_filter] WARNING: no valid points for train camera; "
+                f"using fallback distance={fallback_distance.item():.6f}"
+            )
 
         # TODO remove hard coded value
         # TODO box to gaussian transform
@@ -627,6 +716,24 @@ class GaussianModel:
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
 
+        scene_flow = pcd.scene_flow
+        if scene_flow is None:
+            scene_flow = np.zeros_like(np.asarray(pcd.points))
+        scene_flow = torch.tensor(np.asarray(scene_flow)).float().cuda()
+        if scene_flow.shape[0] != torch.tensor(np.asarray(pcd.points)).shape[0]:
+            scene_flow = scene_flow.T
+        scene_flow = scene_flow[~floater_mask]
+
+        motion_mask = pcd.motion_mask
+        if motion_mask is None:
+            motion_mask = np.zeros((np.asarray(pcd.points).shape[0], 1), dtype=bool)
+        motion_mask = torch.tensor(np.asarray(motion_mask)).cuda()
+        if motion_mask.ndim == 1:
+            motion_mask = motion_mask[:, None]
+        elif motion_mask.shape[1] != 1:
+            motion_mask = motion_mask[:, :1]
+        motion_mask = motion_mask[~floater_mask].bool()
+
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
@@ -647,6 +754,8 @@ class GaussianModel:
 
         if self._xyz.numel() == 0:
             self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+            self._scene_flow = scene_flow
+            self._motion_mask = motion_mask
             self._features_dc = nn.Parameter(
                 features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True)
             )
@@ -662,6 +771,8 @@ class GaussianModel:
             self._xyz = nn.Parameter(
                 torch.cat((self._xyz, fused_point_cloud), dim=0).requires_grad_(True)
             )
+            self._scene_flow = torch.cat((self._scene_flow, scene_flow), dim=0)
+            self._motion_mask = torch.cat((self._motion_mask, motion_mask), dim=0)
             self._features_dc = nn.Parameter(
                 torch.cat(
                     (
@@ -822,6 +933,8 @@ class GaussianModel:
                     "lr": training_args.rotation_lr,
                     "name": "rotation",
                 },
+                {"params": [self._scene_flow], "lr": 0.0, "name": "scene_flow"},
+                {"params": [self._motion_mask], "lr": 0.0, "name": "motion_mask"},
             ]
         elif is_obj and not is_obj_init:
             # not needed actually
@@ -835,6 +948,8 @@ class GaussianModel:
                 },
                 {"params": [self._scaling], "lr": 0.0, "name": "scaling"},
                 {"params": [self._rotation], "lr": 0.0, "name": "rotation"},
+                {"params": [self._scene_flow], "lr": 0.0, "name": "scene_flow"},
+                {"params": [self._motion_mask], "lr": 0.0, "name": "motion_mask"},
             ]
         elif is_obj_init and not is_obj:
             l = [
@@ -851,6 +966,8 @@ class GaussianModel:
                     "lr": 0.001,
                     "name": "rotation",
                 },
+                {"params": [self._scene_flow], "lr": 0.0, "name": "scene_flow"},
+                {"params": [self._motion_mask], "lr": 0.0, "name": "motion_mask"},
             ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15, betas=(0.0, 0.99))
@@ -992,7 +1109,10 @@ class GaussianModel:
                 return lr
 
     def construct_list_of_attributes(self, exclude_filter=False, use_higher_freq=True):
-        l = ["x", "y", "z", "nx", "ny", "nz"]
+        l = ["x", "y", "z"]
+        if not exclude_filter:
+            l.extend(["dx", "dy", "dz", "mx", "my", "mz"])
+        l.extend(["nx", "ny", "nz"])
         # All channels except the 3 DC
         for i in range(self._features_dc.shape[1] * self._features_dc.shape[2]):
             l.append("f_dc_{}".format(i))
@@ -1087,6 +1207,10 @@ class GaussianModel:
     def save_ply_for_3dgs(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         xyz = torch.cat([self._xyz.detach(), self._xyz_prev], dim=0).cpu().numpy()
+        scene_flow = self.get_scene_flow_all.detach().cpu().numpy()
+        motion_mask = self.get_motion_mask_all.detach().float().cpu().numpy()
+        if motion_mask.shape[1] == 1:
+            motion_mask = np.repeat(motion_mask, 3, axis=1)
         normals = np.zeros_like(xyz)
         f_dc = (
             torch.cat(
@@ -1105,19 +1229,48 @@ class GaussianModel:
             .cpu()
             .numpy()
         )
-        
+
         opacities = self.get_opacity_all.detach().cpu().numpy()
         scale = self.get_scaling_all.detach().cpu().numpy()
         rotation = self.get_rotation_all.detach().cpu().numpy()
 
         filter_3D = torch.cat([self.filter_3D.detach(), self.filter_3D_prev.detach()], dim=0).cpu().numpy()
 
+        def _align_rows(arr, target_rows, fill_value=0):
+            if arr.shape[0] == target_rows:
+                return arr
+            if arr.shape[0] > target_rows:
+                print(
+                    f"[save_ply_for_3dgs] WARNING: truncating {arr.shape[0] - target_rows} rows "
+                    f"from {arr.shape} to match xyz={target_rows}"
+                )
+                return arr[:target_rows]
+            pad_shape = (target_rows - arr.shape[0],) + arr.shape[1:]
+            pad = np.full(pad_shape, fill_value, dtype=arr.dtype)
+            print(
+                f"[save_ply_for_3dgs] WARNING: padding {target_rows - arr.shape[0]} rows "
+                f"for {arr.shape} to match xyz={target_rows}"
+            )
+            return np.concatenate([arr, pad], axis=0)
+
+        scene_flow = _align_rows(scene_flow, xyz.shape[0], 0.0)
+        motion_mask = _align_rows(motion_mask, xyz.shape[0], 0.0)
+        normals = _align_rows(normals, xyz.shape[0], 0.0)
+        f_dc = _align_rows(f_dc, xyz.shape[0], 0.0)
+        opacities = _align_rows(opacities, xyz.shape[0], 0.0)
+        scale = _align_rows(scale, xyz.shape[0], 0.0)
+        rotation = _align_rows(rotation, xyz.shape[0], 0.0)
+        filter_3D = _align_rows(filter_3D, xyz.shape[0], 0.0)
+
         # dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes(exclude_filter=True)]
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes(exclude_filter=False)]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         # attributes = np.concatenate((xyz, normals, f_dc, opacities, scale, rotation), axis=1)
-        attributes = np.concatenate((xyz, normals, f_dc, opacities, scale, rotation, filter_3D), axis=1)
+        attributes = np.concatenate(
+            (xyz, scene_flow, motion_mask, normals, f_dc, opacities, scale, rotation, filter_3D),
+            axis=1,
+        )
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -1235,6 +1388,10 @@ class GaussianModel:
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
         xyz = self._xyz.detach().cpu().numpy()
+        scene_flow = self._scene_flow.detach().cpu().numpy()
+        motion_mask = self._motion_mask.detach().float().cpu().numpy()
+        if motion_mask.shape[1] == 1:
+            motion_mask = np.repeat(motion_mask, 3, axis=1)
         normals = np.zeros_like(xyz)
         f_dc = (
             self._features_dc.detach()
@@ -1258,7 +1415,8 @@ class GaussianModel:
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         attributes = np.concatenate(
-            (xyz, normals, f_dc, opacities, scale, rotation, filters_3D), axis=1
+            (xyz, scene_flow, motion_mask, normals, f_dc, opacities, scale, rotation, filters_3D),
+            axis=1,
         )
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, "vertex")
@@ -1437,6 +1595,7 @@ class GaussianModel:
 
     def load_ply_with_filter(self, path):
         plydata = PlyData.read(path)
+        property_names = {p.name for p in plydata.elements[0].properties}
 
         xyz = np.stack(
             (
@@ -1446,6 +1605,28 @@ class GaussianModel:
             ),
             axis=1,
         )
+        if {"dx", "dy", "dz"}.issubset(property_names):
+            scene_flow = np.stack(
+                (
+                    np.asarray(plydata.elements[0]["dx"]),
+                    np.asarray(plydata.elements[0]["dy"]),
+                    np.asarray(plydata.elements[0]["dz"]),
+                ),
+                axis=1,
+            )
+        else:
+            scene_flow = np.zeros_like(xyz)
+        if {"mx", "my", "mz"}.issubset(property_names):
+            motion_mask = np.stack(
+                (
+                    np.asarray(plydata.elements[0]["mx"]),
+                    np.asarray(plydata.elements[0]["my"]),
+                    np.asarray(plydata.elements[0]["mz"]),
+                ),
+                axis=1,
+            )
+        else:
+            motion_mask = np.zeros((xyz.shape[0], 1), dtype=np.float32)
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
 
         features_dc = np.zeros((xyz.shape[0], 3, 1))
@@ -1473,6 +1654,12 @@ class GaussianModel:
 
         self._xyz = nn.Parameter(
             torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True)
+        )
+        self._scene_flow = torch.tensor(
+            scene_flow, dtype=torch.float, device="cuda"
+        )
+        self._motion_mask = torch.tensor(
+            motion_mask[:, :1], dtype=torch.bool, device="cuda"
         )
         self._features_dc = nn.Parameter(
             torch.tensor(features_dc, dtype=torch.float, device="cuda")
@@ -1717,6 +1904,7 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
+            requires_grad = group["name"] not in {"scene_flow", "motion_mask"}
             stored_state = self.optimizer.state.get(group["params"][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -1724,14 +1912,16 @@ class GaussianModel:
 
                 del self.optimizer.state[group["params"][0]]
                 group["params"][0] = nn.Parameter(
-                    (group["params"][0][mask].requires_grad_(True))
+                    group["params"][0][mask],
+                    requires_grad=requires_grad,
                 )
                 self.optimizer.state[group["params"][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
                 group["params"][0] = nn.Parameter(
-                    group["params"][0][mask].requires_grad_(True)
+                    group["params"][0][mask],
+                    requires_grad=requires_grad,
                 )
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
@@ -1745,6 +1935,8 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._scene_flow = optimizable_tensors["scene_flow"]
+        self._motion_mask = optimizable_tensors["motion_mask"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -1779,6 +1971,7 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
+            requires_grad = group["name"] not in {"scene_flow", "motion_mask"}
             stored_state = self.optimizer.state.get(group["params"][0], None)
             if stored_state is not None:
 
@@ -1794,7 +1987,8 @@ class GaussianModel:
                 group["params"][0] = nn.Parameter(
                     torch.cat(
                         (group["params"][0], extension_tensor), dim=0
-                    ).requires_grad_(True)
+                    ),
+                    requires_grad=requires_grad,
                 )
                 self.optimizer.state[group["params"][0]] = stored_state
 
@@ -1803,24 +1997,38 @@ class GaussianModel:
                 group["params"][0] = nn.Parameter(
                     torch.cat(
                         (group["params"][0], extension_tensor), dim=0
-                    ).requires_grad_(True)
+                    ),
+                    requires_grad=requires_grad,
                 )
                 optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
 
     def densification_postfix(
-        self, new_xyz, new_features_dc, new_opacities, new_scaling, new_rotation
+        self,
+        new_xyz,
+        new_features_dc,
+        new_opacities,
+        new_scaling,
+        new_rotation,
+        new_scene_flow,
+        new_motion_mask,
+        new_visibility_filter=None,
+        new_is_sky_filter=None,
+        new_delete_mask=None,
     ):
+        old_current_count = self._xyz.shape[0]
         d = {
             "xyz": new_xyz,
             "f_dc": new_features_dc,
             "opacity": new_opacities,
             "scaling": new_scaling,
             "rotation": new_rotation,
+            "scene_flow": new_scene_flow,
+            "motion_mask": new_motion_mask,
         }
 
-        n_added_points = new_xyz.shape[0] - self.get_xyz.shape[0]
+        n_added_points = new_xyz.shape[0]
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -1828,14 +2036,58 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._scene_flow = optimizable_tensors["scene_flow"]
+        self._motion_mask = optimizable_tensors["motion_mask"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
         if n_added_points > 0:
-            assert (
-                len(self.visibility_filter_all) == 0
-            ), "We have not yet implemented visibility filter densification."
+            if new_visibility_filter is None:
+                new_visibility_filter = torch.zeros(
+                    n_added_points, dtype=torch.bool, device="cuda"
+                )
+            if new_is_sky_filter is None:
+                new_is_sky_filter = torch.zeros(
+                    n_added_points, dtype=torch.bool, device="cuda"
+                )
+            if new_delete_mask is None:
+                new_delete_mask = torch.zeros(
+                    n_added_points, dtype=torch.bool, device="cuda"
+                )
+
+            if len(self.visibility_filter_all) == 0:
+                current_visibility = torch.zeros(
+                    old_current_count, dtype=torch.bool, device="cuda"
+                )
+                current_sky = torch.zeros(
+                    old_current_count, dtype=torch.bool, device="cuda"
+                )
+                current_delete = torch.zeros(
+                    old_current_count, dtype=torch.bool, device="cuda"
+                )
+                prev_visibility = torch.empty(0, dtype=torch.bool, device="cuda")
+                prev_sky = torch.empty(0, dtype=torch.bool, device="cuda")
+                prev_delete = torch.empty(0, dtype=torch.bool, device="cuda")
+            else:
+                current_visibility = self.visibility_filter_all[:old_current_count]
+                prev_visibility = self.visibility_filter_all[old_current_count:]
+                current_sky = self.is_sky_filter[:old_current_count]
+                prev_sky = self.is_sky_filter[old_current_count:]
+                current_delete = self.delete_mask_all[:old_current_count]
+                prev_delete = self.delete_mask_all[old_current_count:]
+
+            self.visibility_filter_all = torch.cat(
+                (current_visibility, new_visibility_filter.bool(), prev_visibility),
+                dim=0,
+            )
+            self.is_sky_filter = torch.cat(
+                (current_sky, new_is_sky_filter.bool(), prev_sky), dim=0
+            )
+            self.delete_mask_all = torch.cat(
+                (current_delete, new_delete_mask.bool(), prev_delete), dim=0
+            )
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -1862,9 +2114,34 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
+        new_scene_flow = self._scene_flow[selected_pts_mask].repeat(N, 1)
+        new_motion_mask = self._motion_mask[selected_pts_mask].repeat(N, 1)
+        if len(self.visibility_filter_all) == 0:
+            new_visibility_filter = None
+            new_is_sky_filter = None
+            new_delete_mask = None
+        else:
+            new_visibility_filter = self.visibility_filter_all[:n_init_points][
+                selected_pts_mask
+            ].repeat(N)
+            new_is_sky_filter = self.is_sky_filter[:n_init_points][
+                selected_pts_mask
+            ].repeat(N)
+            new_delete_mask = self.delete_mask_all[:n_init_points][
+                selected_pts_mask
+            ].repeat(N)
 
         self.densification_postfix(
-            new_xyz, new_features_dc, new_opacity, new_scaling, new_rotation
+            new_xyz,
+            new_features_dc,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_scene_flow,
+            new_motion_mask,
+            new_visibility_filter,
+            new_is_sky_filter,
+            new_delete_mask,
         )
 
         prune_filter = torch.cat(
@@ -1891,9 +2168,31 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        new_scene_flow = self._scene_flow[selected_pts_mask]
+        new_motion_mask = self._motion_mask[selected_pts_mask]
+        if len(self.visibility_filter_all) == 0:
+            new_visibility_filter = None
+            new_is_sky_filter = None
+            new_delete_mask = None
+        else:
+            current_count = self._xyz.shape[0]
+            new_visibility_filter = self.visibility_filter_all[:current_count][
+                selected_pts_mask
+            ]
+            new_is_sky_filter = self.is_sky_filter[:current_count][selected_pts_mask]
+            new_delete_mask = self.delete_mask_all[:current_count][selected_pts_mask]
 
         self.densification_postfix(
-            new_xyz, new_features_dc, new_opacities, new_scaling, new_rotation
+            new_xyz,
+            new_features_dc,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+            new_scene_flow,
+            new_motion_mask,
+            new_visibility_filter,
+            new_is_sky_filter,
+            new_delete_mask,
         )
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):

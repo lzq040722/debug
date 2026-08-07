@@ -8,6 +8,7 @@ Local modules (WonderPlay_new): util, models, arguments, gaussian_renderer, scen
 import gc
 import os
 import random
+import shutil
 import sys
 import time
 import json
@@ -172,13 +173,16 @@ def train_hashgrid(pc, model, scheduler_gamma=0.2, scheduler_step=100, iteration
     if freeze_mlp:
         for p in model.mlp.parameters():
             p.requires_grad = False
+    else:
+        for p in model.mlp.parameters():
+            p.requires_grad = True
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.99), eps=1e-15)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step, gamma=scheduler_gamma)
 
     for iteration in range(iterations):
         pred_flow = model(pos_all)
-        loss = torch.nn.functional.mse_loss(pred_flow, flow_train)
+        loss = ((pred_flow - flow_train) ** 2).sum()
 
         optimizer.zero_grad()
         loss.backward()
@@ -191,6 +195,73 @@ def train_hashgrid(pc, model, scheduler_gamma=0.2, scheduler_step=100, iteration
     model.eval()
     print(f"[train_hashgrid] Training completed!")
     return model
+
+
+def make_final_hints_xy(hints, H, W, yflip=False, as_column_list=True, dtype=np.float32):
+    """Convert hints from [[sx,sy,ex,ey], ...] to column lists (from LivingWorld)"""
+    hints = np.asarray(hints)
+    if hints.ndim == 2 and hints.shape[0] == 4:
+        # Already in (4, N) format
+        pass
+    elif hints.ndim == 2 and hints.shape[1] == 4:
+        # Convert from (N, 4) to (4, N)
+        hints = hints.T
+    else:
+        raise ValueError(f"Expected hints in (4,N) or (N,4), got {hints.shape}")
+
+    N = hints.shape[1]
+    if N == 0:
+        return [], [], [], []
+
+    sx = hints[0].astype(dtype, copy=False)
+    sy = hints[1].astype(dtype, copy=False)
+    ex = hints[2].astype(dtype, copy=False)
+    ey = hints[3].astype(dtype, copy=False)
+
+    if yflip:
+        sy = (H - 1) - sy
+        ey = (H - 1) - ey
+
+    sx = np.clip(sx, 0, W - 1)
+    ex = np.clip(ex, 0, W - 1)
+    sy = np.clip(sy, 0, H - 1)
+    ey = np.clip(ey, 0, H - 1)
+
+    if as_column_list:
+        to_col_list = lambda v: [np.asarray([v[i]], dtype=dtype) for i in range(N)]
+        return to_col_list(sx), to_col_list(sy), to_col_list(ex), to_col_list(ey)
+    else:
+        return sx.astype(float).tolist(), sy.astype(float).tolist(), ex.astype(float).tolist(), ey.astype(float).tolist()
+
+
+def estimate_flow(frame_pil, depth, mask, final_hint_start_x, final_hint_start_y, final_hint_end_x, final_hint_end_y, args):
+    """Estimate 2D flow using Cinemagraphy (from LivingWorld)"""
+    from thirdparty.cinemagraphy.demo import eulerian_estimation
+
+    print(
+        "[estimate_flow] Motion hints accepted:",
+        len(final_hint_start_x),
+        "vectors",
+        list(zip(final_hint_start_x, final_hint_start_y, final_hint_end_x, final_hint_end_y)),
+    )
+    frame = {
+        'image': frame_pil,
+        'depth': depth,
+        'mask': mask,
+        'final_hint_start_x': final_hint_start_x,
+        'final_hint_start_y': final_hint_start_y,
+        'final_hint_end_x': final_hint_end_x,
+        'final_hint_end_y': final_hint_end_y,
+    }
+    flow = eulerian_estimation(args, frame)
+    magnitude = flow.norm(dim=1)
+    print(
+        "[estimate_flow] Motion flow stats:",
+        f"active={(magnitude > 1e-4).float().mean().item():.4f}",
+        f"mean={magnitude.mean().item():.6f}",
+        f"max={magnitude.max().item():.6f}",
+    )
+    return flow
 
 
 # ========== End LivingWorld Functions ==========
@@ -209,53 +280,203 @@ def seeding(seed):
 
 # ========== Environment Motion Rendering Function ==========
 
-def environment_motion_rendering(gaussians, scene, save_dir, config, video_gen_fps):
+def prepare_environment_motion_fields(save_dir, config):
+    """Estimate 2D motion fields and bind them to current_pc_latest before 3DGS training."""
+    env_config = config.get('environment_motion', {})
+    sam_prompt = env_config.get('sam_prompt', 'water')
+    fixed_hints = env_config.get('fixed_hints', [])
+
+    if len(fixed_hints) == 0:
+        raise ValueError("No fixed_hints in config, cannot estimate environment motion")
+
+    print(f"[environment_motion_prepare] Step 1: SAM3 segmentation with prompt='{sam_prompt}'")
+    from sam3.model_builder import build_sam3_image_model
+    from sam3.model.sam3_image_processor import Sam3Processor
+
+    sam3_model = build_sam3_image_model()
+    sam3_processor = Sam3Processor(sam3_model)
+
+    image_tensor = kf_gen.image_latest
+    image_pil = ToPILImage()(image_tensor[0].detach().cpu().clamp(0, 1))
+
+    state = sam3_processor.set_image(image_pil)
+    prompts = [p.strip() for p in str(sam_prompt).split(",") if p.strip()]
+    masks_list = []
+    for prompt in prompts:
+        output = sam3_processor.set_text_prompt(state=state, prompt=prompt)
+        masks = output.get("masks", None)
+        if masks is None or (torch.is_tensor(masks) and masks.numel() == 0):
+            continue
+        masks_np = masks.detach().cpu().numpy() if torch.is_tensor(masks) else np.asarray(masks)
+        if masks_np.ndim == 2:
+            masks_np = masks_np[None, ...]
+        elif masks_np.ndim == 4:
+            if masks_np.shape[0] == 1:
+                masks_np = masks_np[0, ...]
+            if masks_np.ndim == 4 and masks_np.shape[1] == 1:
+                masks_np = masks_np[:, 0, :, :]
+        if masks_np.ndim == 3 and masks_np.shape[0] > 0:
+            masks_list.append(masks_np.astype(bool))
+
+    if len(masks_list) == 0:
+        print(f"[environment_motion_prepare] WARNING: SAM3 returned no masks for '{sam_prompt}'")
+        motion_mask_2d = np.ones((512, 512), dtype=bool)
+    else:
+        motion_mask_2d = np.any(np.concatenate(masks_list, axis=0), axis=0)
+
+    mask_area = motion_mask_2d.sum()
+    print(
+        f"[environment_motion_prepare] SAM3 result: "
+        f"{mask_area} pixels ({mask_area / (512 * 512) * 100:.2f}%)"
+    )
+    if mask_area == 0:
+        print("[environment_motion_prepare] WARNING: empty SAM3 mask, falling back to full-image motion")
+        motion_mask_2d = np.ones((512, 512), dtype=bool)
+
+    Image.fromarray((motion_mask_2d.astype(np.uint8) * 255)).save(save_dir / "sam3_mask.png")
+
+    print(f"[environment_motion_prepare] Step 2: Cinemagraphy 2D flow estimation with {len(fixed_hints)} hints")
+    hints_array = np.array(fixed_hints)
+    final_hint_start_x, final_hint_start_y, final_hint_end_x, final_hint_end_y = make_final_hints_xy(
+        hints_array, 512, 512, yflip=False, as_column_list=True
+    )
+
+    import argparse
+    cinema_dir = _WONDERPLAY_DIR / "thirdparty" / "cinemagraphy"
+    cinema_ckpt_dir = cinema_dir / "ckpts"
+    args = argparse.Namespace()
+    args.input_dir = (save_dir / "cinemagraphy").as_posix()
+    Path(args.input_dir).mkdir(exist_ok=True, parents=True)
+    args.distributed = False
+    args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    args.save_frames = False
+    args.correct_inpaint_depth = False
+    args.config = (cinema_dir / "config.yaml").as_posix()
+    args.ckpt_path = (cinema_ckpt_dir / "model_150000.pth").as_posix()
+    args.cinema_ckpt = cinema_ckpt_dir.as_posix()
+    args.no_reload = False
+    args.no_load_opt = False
+    args.no_load_scheduler = False
+    args.ds_factor = 1.0
+    args.flow_scale = 1.0
+    args.eval_mode = True
+    args.point_radius = 1.5
+    args.vary_pts_radius = True
+    args.split = "demo"
+    args.scene_id = scene_name or config.get("example_name", "scene")
+
+    flow_2d = estimate_flow(
+        image_pil,
+        kf_gen.depth_latest,
+        motion_mask_2d,
+        final_hint_start_x,
+        final_hint_start_y,
+        final_hint_end_x,
+        final_hint_end_y,
+        args,
+    )
+
+    scene_flow, point_motion_mask = kf_gen.attach_flow_to_current_pc_latest(
+        flow=flow_2d,
+        motion_mask=motion_mask_2d,
+        valid_mask=~kf_gen.sky_mask_latest,
+        depth=kf_gen.depth_latest,
+    )
+    motion_count = point_motion_mask.sum().item()
+    point_count = point_motion_mask.shape[0]
+    print(
+        f"[environment_motion_prepare] Bound motion to current point cloud: "
+        f"{motion_count}/{point_count} points ({motion_count / max(point_count, 1) * 100:.2f}%)"
+    )
+    print(
+        "[environment_motion_prepare] Scene flow stats:",
+        f"mean={scene_flow.mean(dim=0).detach().cpu().numpy()}",
+        f"std={scene_flow.std(dim=0).detach().cpu().numpy()}",
+    )
+    return flow_2d, motion_mask_2d
+
+
+def environment_motion_rendering(gaussians, scene, save_dir, config, video_gen_fps, sky_gaussians=None):
     """
-    LivingWorld environment motion rendering using HashGrid MLP
+    LivingWorld environment motion rendering using HashGrid MLP.
+    SAM3/Cinemagraphy/unprojection are bound to the point cloud before base
+    Gaussian training; this function only trains HashGrid and renders frames.
     """
     global iter_number, kf_gen, opt, background
 
     print("[environment_motion_rendering] Starting environment motion rendering...")
 
-    # Get configuration
     env_config = config.get('environment_motion', {})
-    scale_factor = env_config.get('scale_factor', 2.0)
-    num_frames = 100
+    scale_factor = env_config.get('scale_factor', 1.0)
+    num_frames = 50
 
-    # Initialize scene_flow and motion_mask
-    means3D = gaussians.get_xyz_all
-    scene_flow = torch.zeros_like(means3D)
+    motion_mask_all = gaussians.get_motion_mask_all
+    motion_count = int(motion_mask_all.bool().sum().item())
+    point_count = int(motion_mask_all.shape[0])
+    print(
+        f"[environment_motion_rendering] Gaussian motion mask: "
+        f"{motion_count}/{point_count} points ({motion_count / max(point_count, 1) * 100:.2f}%)"
+    )
+    if motion_count == 0:
+        print("[environment_motion_rendering] WARNING: No motion points, rendering will be static")
 
-    # Fixed motion direction: forward (y-axis)
-    scene_flow[:, 1] = 0.001
-
-    # Set to gaussians object
-    gaussians._scene_flow_all = scene_flow
-    gaussians._motion_mask_all = torch.ones(means3D.shape[0], 1, dtype=torch.bool, device='cuda')
-
-    print(f"[environment_motion_rendering] Initialized scene_flow for {means3D.shape[0]} points")
-    print(f"[environment_motion_rendering] Motion direction: {scene_flow.mean(dim=0).cpu().numpy()}")
-
-    # Train HashGrid motion model
+    print(f"[environment_motion_rendering] Step 4: Training HashGrid motion model...")
     from hashgrid import HashEncoderMotionModel
-    print("[environment_motion_rendering] Training HashGrid motion model...")
     motion_model = HashEncoderMotionModel().to('cuda')
     motion_model = train_hashgrid(gaussians, motion_model, iterations=100)
 
-    # Setup camera
+    print(f"[environment_motion_rendering] Step 5: Rendering {num_frames} frames with scale_factor={scale_factor}...")
+
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_cam = viewpoint_stack[0]
     gt_image = viewpoint_cam.original_image.cuda()
-    ToPILImage()(gt_image).save(save_dir / f"gt.png")
+    ToPILImage()(gt_image).save(save_dir / "gt.png")
+    text_prompt = config.get("text_prompt", " ")
+    with open((save_dir / "text_prompt.txt").as_posix(), "w") as f:
+        f.write(text_prompt)
 
-    # Create output directory
     output_dir = save_dir / 'environment_motion'
     output_dir.mkdir(exist_ok=True, parents=True)
+    traj_dir = save_dir / "traj_00"
+    save_kwargs = [
+        "frames",
+        "masks",
+        "depths",
+        "flows",
+        "flows_actual",
+        "flows_arrows",
+    ]
+    for save_name in save_kwargs:
+        save_path = traj_dir / save_name
+        if save_path.exists():
+            shutil.rmtree(save_path)
+        save_path.mkdir(parents=True, exist_ok=True)
 
-    # Rendering loop
-    print(f"[environment_motion_rendering] Rendering {num_frames} frames with scale_factor={scale_factor}...")
+    static_pkg = render_MLP(
+        viewpoint_camera=viewpoint_cam,
+        pc=gaussians,
+        motion_model=None,
+        t=0,
+        opt=opt,
+        bg_color=background,
+        scale_factor=scale_factor,
+        render_visible=False,
+    )
+    ToPILImage()(static_pkg["render"].detach().cpu().clamp(0, 1)).save(
+        output_dir / "debug_static_frame_0000.png"
+    )
 
     frames = []
+    frame_pils = []
+    depth_arrays = []
+    flow_tensors = []
+    flow_arrow_pils = []
+    prev_gray = None
+    mask_img = None
+    sam_mask_path = save_dir / "sam3_mask.png"
+    if sam_mask_path.exists():
+        mask_img = cv2.imread(sam_mask_path.as_posix(), cv2.IMREAD_GRAYSCALE)
+
     for frame_idx in tqdm(range(num_frames), desc="Rendering frames"):
         render_pkg = render_MLP(
             viewpoint_camera=viewpoint_cam,
@@ -265,26 +486,125 @@ def environment_motion_rendering(gaussians, scene, save_dir, config, video_gen_f
             opt=opt,
             bg_color=background,
             scale_factor=scale_factor,
-            render_visible=True
+            render_visible=False
         )
 
-        # Save frame
         image = render_pkg['render']
-        image_np = (image.permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)
+        image_np = (image.permute(1, 2, 0).detach().cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
         frames.append(image_np)
         Image.fromarray(image_np).save(output_dir / f"frame_{frame_idx:04d}.png")
 
-    # Save as video
+        sid = frame_idx
+        image_pil = Image.fromarray(image_np)
+        image_pil.save(traj_dir / "frames" / f"frame_{sid:08d}.png")
+        frame_pils.append(image_pil)
+
+        depth = render_pkg.get("depth", None)
+        if depth is not None:
+            depth_cpu = depth.detach().cpu()
+            depth_arrays.append(depth_cpu.numpy())
+            ToPILImage()(depth_cpu).save(traj_dir / "depths" / f"depth_{sid:08d}.png")
+
+        if mask_img is None:
+            mask_for_frame = np.zeros((image_np.shape[0], image_np.shape[1]), dtype=np.uint8)
+        else:
+            mask_for_frame = cv2.resize(
+                mask_img,
+                (image_np.shape[1], image_np.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        cv2.imwrite((traj_dir / "masks" / f"frame_{sid:08d}.png").as_posix(), mask_for_frame)
+
+        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+        if prev_gray is None:
+            flow_np = np.zeros((image_np.shape[0], image_np.shape[1], 2), dtype=np.float32)
+        else:
+            flow_np = cv2.calcOpticalFlowFarneback(
+                prev_gray,
+                gray,
+                None,
+                pyr_scale=0.5,
+                levels=3,
+                winsize=15,
+                iterations=3,
+                poly_n=5,
+                poly_sigma=1.2,
+                flags=0,
+            ).astype(np.float32)
+        prev_gray = gray
+
+        flow_tensor = torch.from_numpy(flow_np).permute(2, 0, 1).float()
+        flow_tensors.append(flow_tensor)
+        flow_actual = np.clip((flow_tensor.numpy() / 512.0 + 1.0) * 0.5, 0.0, 1.0)
+        np.save((traj_dir / "flows_actual" / f"flow_{sid:08d}.npy").as_posix(), flow_actual)
+
+        flow_frame = flow_to_image(flow_tensor)
+        flow_pil = ToPILImage()(flow_frame)
+        flow_pil.save(traj_dir / "flows" / f"flow_{sid:08d}.png")
+
+        flow_arrows = visualize_flow_as_arrows(flow_tensor, image.detach().cpu())
+        flow_arrow_pil = ToPILImage()(flow_arrows)
+        flow_arrow_pil.save(traj_dir / "flows_arrows" / f"frame_{sid:08d}.png")
+        flow_arrow_pils.append(flow_arrow_pil)
+
     print(f"[environment_motion_rendering] Saving video...")
     imageio.mimsave(
         (output_dir / "environment_motion.mp4").as_posix(),
         frames,
         fps=video_gen_fps
     )
+    frame_pils[0].save(
+        (traj_dir / "render_video.gif").as_posix(),
+        save_all=True,
+        append_images=frame_pils[1:],
+        fps=video_gen_fps,
+        loop=0,
+    )
+    imageio.mimsave((traj_dir / "render_video.mp4").as_posix(), frame_pils, fps=video_gen_fps)
+
+    if len(depth_arrays) > 0:
+        render_depths = np.concatenate(depth_arrays, axis=0)
+        render_depths = torch.from_numpy(render_depths).float().cuda()
+        render_depths_min = render_depths.min()
+        render_depths_max = render_depths.max()
+        denom = (render_depths_max - render_depths_min).clamp_min(1e-12)
+        render_depths = (render_depths - render_depths_min) ** 2 / denom ** 2
+        render_depth_pils = [ToPILImage()(1 - depth) for depth in render_depths]
+        imageio.mimsave(
+            (traj_dir / "render_depths.mp4").as_posix(),
+            render_depth_pils,
+            fps=video_gen_fps,
+        )
+        (traj_dir / "depths_compose").mkdir(parents=True, exist_ok=True)
+        for i, depth_pil in enumerate(render_depth_pils):
+            depth_pil.save(traj_dir / "depths_compose" / f"frame_{i:08d}.png")
+
+    if len(flow_tensors) > 0:
+        render_flows = flow_to_image(torch.stack(flow_tensors, dim=0))
+        render_flow_pils = [ToPILImage()(flow) for flow in render_flows]
+        imageio.mimsave(
+            (traj_dir / "render_flows.mp4").as_posix(),
+            render_flow_pils,
+            fps=video_gen_fps,
+        )
+        (traj_dir / "flows_compose").mkdir(parents=True, exist_ok=True)
+        for i, flow_pil in enumerate(render_flow_pils):
+            flow_pil.save(traj_dir / "flows_compose" / f"frame_{i:08d}.png")
+
+    if len(flow_arrow_pils) > 0:
+        imageio.mimsave(
+            (traj_dir / "render_flows_arrows.mp4").as_posix(),
+            flow_arrow_pils,
+            fps=video_gen_fps,
+        )
 
     print(f"[environment_motion_rendering] Completed! Saved to {output_dir}")
     print(f"  - {num_frames} frames")
     print(f"  - Video: environment_motion.mp4")
+    print(f"  - Stage2-compatible trajectory: traj_00/render_video.mp4")
+    print(f"  - Stage2-compatible flows: traj_00/flows_actual/*.npy")
+    print(f"  - SAM3 mask: sam3_mask.png")
+    return
 
 
 # ========== End Environment Motion Function ==========
@@ -599,6 +919,7 @@ def run(config, dt_string=None):
         gaussians.load_ply_with_filter(
             str(Path(config["sky_image_dir"]) / "finished_3dgs_sky_tanh.ply")
         )  # pure sky
+    sky_gaussians = gaussians
 
     gaussians.visibility_filter_all = torch.zeros(
         gaussians.get_xyz_all.shape[0], dtype=torch.bool, device="cuda"
@@ -611,6 +932,13 @@ def run(config, dt_string=None):
     particle_num_sky = gaussians.get_xyz_all.shape[0]
     particle_num_base = 0
     particle_num_object = 0
+
+    motion_type = config.get("motion_type", "object")
+    save_dir_sim = None
+    if motion_type == "environment":
+        save_dir_sim = kf_gen.run_dir / "simulation"
+        save_dir_sim.mkdir(parents=True, exist_ok=True)
+        prepare_environment_motion_fields(save_dir_sim, config)
 
     ### First scene 3DGS
     if config["gen_layer"]:
@@ -663,18 +991,18 @@ def run(config, dt_string=None):
     # physics Simulator. The base + sky gaussians we already trained are enough
     # to drive LivingWorld's HashGrid motion field. Skip everything below to
     # avoid touching object-only code paths (empty _xyz, Simulator, bbox, ...).
-    motion_type = config.get("motion_type", "object")
     if motion_type == "environment":
         print("=" * 60)
-        print("Environment Motion (LivingWorld HashGrid) — skipping object training and physics")
+        print("Environment Motion (LivingWorld HashGrid) - skipping object training and physics")
         print("=" * 60)
         tdgs_cam = convert_pt3d_cam_to_3dgs_cam(
             kf_gen.get_camera_at_origin(), xyz_scale=xyz_scale
         )
         gaussians.set_inscreen_points_to_visible(tdgs_cam)
 
-        save_dir_sim = kf_gen.run_dir / "simulation"
-        save_dir_sim.mkdir(parents=True, exist_ok=True)
+        if save_dir_sim is None:
+            save_dir_sim = kf_gen.run_dir / "simulation"
+            save_dir_sim.mkdir(parents=True, exist_ok=True)
         save_dir_3d = kf_gen.run_dir / "3d_results"
         save_dir_3d.mkdir(parents=True, exist_ok=True)
         gaussians.save_ply_for_3dgs((save_dir_3d / "gaussians.ply").as_posix())
@@ -683,7 +1011,12 @@ def run(config, dt_string=None):
             scene = Scene(traindata_layer, gaussians, opt)
 
         environment_motion_rendering(
-            gaussians, scene, save_dir_sim, config, video_gen_fps=8
+            gaussians,
+            scene,
+            save_dir_sim,
+            config,
+            video_gen_fps=8,
+            sky_gaussians=sky_gaussians,
         )
         print("Scene compositional reconstruction and environment motion finished.")
         return
@@ -863,23 +1196,19 @@ def run(config, dt_string=None):
         f.close()
         # train_simulation(sim, scene, save_dir_sim)
 
-        # ========== Motion Type Branch ==========
-        motion_type = config.get('motion_type', 'object')
-
-        if motion_type == "environment":
-            print("=" * 60)
-            print("Environment Motion (LivingWorld HashGrid)")
-            print("=" * 60)
-
-            # Call environment motion function
-            environment_motion_rendering(gaussians, scene, save_dir_sim, config, video_gen_fps)
-        else:
-            print("=" * 60)
-            print("Object Motion (WonderPlay Genesis)")
-            print("=" * 60)
-
-            # Original WonderPlay physics simulation
-            simulation_efficient(sim, scene, save_dir_sim, config, gt_masks, object_pts_num_list, simulation_steps, video_gen_fps)
+        print("=" * 60)
+        print("Object Motion (WonderPlay Genesis)")
+        print("=" * 60)
+        simulation_efficient(
+            sim,
+            scene,
+            save_dir_sim,
+            config,
+            gt_masks,
+            object_pts_num_list,
+            simulation_steps,
+            video_gen_fps,
+        )
 
     print("Scene compositional reconstruction and simulation finished.")
 

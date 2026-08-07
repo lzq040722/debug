@@ -220,6 +220,8 @@ class FrameSyn(torch.nn.Module):
             repo_id="TencentARC/InstantMesh",
             filename="instant_mesh_large.ckpt",
             repo_type="model",
+            cache_dir = '/root/autodl-tmp/huggingface/hub',
+            local_files_only = True
         )
         if 'imgto3d_resolution' in self.config:
             instantmesh_config.model_config.params.grid_res = self.config['imgto3d_resolution']
@@ -836,6 +838,68 @@ class FrameSyn(torch.nn.Module):
             return {k: v.detach() for k, v in self.current_pc_latest.items()}
 
     @torch.no_grad()
+    def attach_flow_to_current_pc_latest(self, flow, motion_mask, valid_mask=None, depth=None, camera=None):
+        if self.current_pc_latest is None:
+            raise RuntimeError("current_pc_latest is not initialized")
+        if depth is None:
+            depth = self.depth_latest
+        if camera is None:
+            camera = self.current_camera
+
+        kf_camera = convert_pytorch3d_kornia(camera, self.init_focal_length)
+        point_depth = rearrange(depth, "b c h w -> (w h b) c")
+        new_points_3d = kf_camera.unproject(self.points, point_depth)
+
+        flow_for_points = flow.detach().to(self.device).squeeze(0).permute(2, 1, 0)
+        flow_points = (
+            torch.stack(
+                torch.meshgrid(
+                    torch.arange(512, device=self.device).float() + 0.5,
+                    torch.arange(512, device=self.device).float() + 0.5,
+                    indexing="ij",
+                ),
+                -1,
+            )
+            + flow_for_points
+        )
+        flow_points = rearrange(flow_points, "h w c -> (h w) c")
+        flow_points_3d = kf_camera.unproject(flow_points, point_depth)
+        scene_flow = flow_points_3d - new_points_3d
+
+        if isinstance(motion_mask, np.ndarray):
+            motion_mask_tensor = torch.from_numpy(motion_mask).to(self.device)
+        else:
+            motion_mask_tensor = motion_mask.to(self.device)
+        if motion_mask_tensor.ndim == 2:
+            motion_mask_tensor = motion_mask_tensor[None, None]
+        elif motion_mask_tensor.ndim == 3:
+            motion_mask_tensor = motion_mask_tensor[:, None]
+        motion_mask_tensor = rearrange(
+            motion_mask_tensor.bool(), "b c h w -> (w h b) c"
+        )
+
+        if valid_mask is not None:
+            extract_mask = rearrange(valid_mask, "b c h w -> (w h b) c")[:, 0].bool()
+            scene_flow = scene_flow[extract_mask]
+            motion_mask_tensor = motion_mask_tensor[extract_mask]
+
+        latest_count = self.current_pc_latest["xyz"].shape[0]
+        if scene_flow.shape[0] != latest_count:
+            raise RuntimeError(
+                "flow/mask point count does not match current_pc_latest: "
+                f"{scene_flow.shape[0]} vs {latest_count}"
+            )
+
+        self.current_pc_latest["scene_flow"] = scene_flow
+        self.current_pc_latest["motion_mask"] = motion_mask_tensor.bool()
+
+        if self.current_pc is not None and self.current_pc["xyz"].shape[0] == latest_count:
+            self.current_pc["scene_flow"] = scene_flow
+            self.current_pc["motion_mask"] = motion_mask_tensor.bool()
+
+        return scene_flow, motion_mask_tensor.bool()
+
+    @torch.no_grad()
     def update_current_pc(
         self,
         points,
@@ -846,16 +910,39 @@ class FrameSyn(torch.nn.Module):
         object_id=None,
         object_mask=None,
         ground_mask=None,
+        scene_flow=None,
+        motion_mask=None,
     ):
+        if scene_flow is None:
+            scene_flow = torch.zeros_like(points)
+        if motion_mask is None:
+            motion_mask = torch.zeros(
+                points.shape[0], 1, dtype=torch.bool, device=points.device
+            )
+        elif motion_mask.ndim == 1:
+            motion_mask = motion_mask[:, None]
+        motion_mask = motion_mask.bool()
+
         if gen_sky:
             if self.current_pc_sky is None:
-                self.current_pc_sky = {"xyz": points, "rgb": colors}
+                self.current_pc_sky = {
+                    "xyz": points,
+                    "rgb": colors,
+                    "scene_flow": scene_flow,
+                    "motion_mask": motion_mask,
+                }
             else:
                 self.current_pc_sky["xyz"] = torch.cat(
                     [self.current_pc_sky["xyz"], points], dim=0
                 )
                 self.current_pc_sky["rgb"] = torch.cat(
                     [self.current_pc_sky["rgb"], colors], dim=0
+                )
+                self.current_pc_sky["scene_flow"] = torch.cat(
+                    [self.current_pc_sky["scene_flow"], scene_flow], dim=0
+                )
+                self.current_pc_sky["motion_mask"] = torch.cat(
+                    [self.current_pc_sky["motion_mask"], motion_mask], dim=0
                 )
         elif gen_layer:
             if object_id is not None:
@@ -865,6 +952,8 @@ class FrameSyn(torch.nn.Module):
                             "xyz": points,
                             "rgb": colors,
                             "normals": normals,
+                            "scene_flow": scene_flow,
+                            "motion_mask": motion_mask,
                             "num": points.shape[0],
                             "mask": object_mask,
                         }
@@ -876,6 +965,8 @@ class FrameSyn(torch.nn.Module):
                     "xyz": points,
                     "rgb": colors,
                     "normals": normals,
+                    "scene_flow": scene_flow,
+                    "motion_mask": motion_mask,
                 }
             else:
                 self.current_pc_layer["xyz"] = torch.cat(
@@ -887,6 +978,12 @@ class FrameSyn(torch.nn.Module):
                 self.current_pc_layer["normals"] = torch.cat(
                     [self.current_pc_layer["normals"], normals], dim=0
                 )
+                self.current_pc_layer["scene_flow"] = torch.cat(
+                    [self.current_pc_layer["scene_flow"], scene_flow], dim=0
+                )
+                self.current_pc_layer["motion_mask"] = torch.cat(
+                    [self.current_pc_layer["motion_mask"], motion_mask], dim=0
+                )
 
             if object_id is not None:
                 # if with object id, concat all object pts to train them together
@@ -894,16 +991,25 @@ class FrameSyn(torch.nn.Module):
                     "xyz": self.current_pc_layer["xyz"],
                     "rgb": self.current_pc_layer["rgb"],
                     "normals": self.current_pc_layer["normals"],
+                    "scene_flow": self.current_pc_layer["scene_flow"],
+                    "motion_mask": self.current_pc_layer["motion_mask"],
                 }
             else:
                 self.current_pc_layer_latest = {
                     "xyz": points,
                     "rgb": colors,
                     "normals": normals,
+                    "scene_flow": scene_flow,
+                    "motion_mask": motion_mask,
                 }
         else:
             if self.current_pc is None:
-                self.current_pc = {"xyz": points, "rgb": colors}
+                self.current_pc = {
+                    "xyz": points,
+                    "rgb": colors,
+                    "scene_flow": scene_flow,
+                    "motion_mask": motion_mask,
+                }
             else:
                 self.current_pc["xyz"] = torch.cat(
                     [self.current_pc["xyz"], points], dim=0
@@ -911,7 +1017,19 @@ class FrameSyn(torch.nn.Module):
                 self.current_pc["rgb"] = torch.cat(
                     [self.current_pc["rgb"], colors], dim=0
                 )
-            self.current_pc_latest = {"xyz": points, "rgb": colors, "normals": normals}
+                self.current_pc["scene_flow"] = torch.cat(
+                    [self.current_pc["scene_flow"], scene_flow], dim=0
+                )
+                self.current_pc["motion_mask"] = torch.cat(
+                    [self.current_pc["motion_mask"], motion_mask], dim=0
+                )
+            self.current_pc_latest = {
+                "xyz": points,
+                "rgb": colors,
+                "normals": normals,
+                "scene_flow": scene_flow,
+                "motion_mask": motion_mask,
+            }
             if ground_mask is not None:
                 self.current_pc.update({"ground_mask": ground_mask})
                 self.current_pc_latest.update({"ground_mask": ground_mask})
@@ -1160,6 +1278,26 @@ class FrameSyn(torch.nn.Module):
         pcd_points = current_pc["xyz"].permute(1, 0).cpu().numpy() * xyz_scale
         pcd_colors = current_pc["rgb"].cpu().numpy()
         pcd_normals = current_pc["normals"].cpu().numpy()
+        pcd_scene_flow = (
+            current_pc.get("scene_flow", torch.zeros_like(current_pc["xyz"]))
+            .permute(1, 0)
+            .cpu()
+            .numpy()
+            * xyz_scale
+        )
+        pcd_motion_mask = (
+            current_pc.get(
+                "motion_mask",
+                torch.zeros(
+                    current_pc["xyz"].shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device=current_pc["xyz"].device,
+                ),
+            )
+            .cpu()
+            .numpy()
+        )
 
         frames = []
 
@@ -1194,6 +1332,8 @@ class FrameSyn(torch.nn.Module):
             "pcd_points": pcd_points,
             "pcd_colors": pcd_colors,
             "pcd_normals": pcd_normals,
+            "pcd_scene_flow": pcd_scene_flow,
+            "pcd_motion_mask": pcd_motion_mask,
             "camera_angle_x": camera_angle_x,
             "W": W,
             "H": H,
@@ -1227,6 +1367,26 @@ class FrameSyn(torch.nn.Module):
         pcd_points = current_pc["xyz"].permute(1, 0).cpu().numpy() * xyz_scale
         pcd_colors = current_pc["rgb"].cpu().numpy()
         pcd_normals = current_pc["normals"].cpu().numpy()
+        pcd_scene_flow = (
+            current_pc.get("scene_flow", torch.zeros_like(current_pc["xyz"]))
+            .permute(1, 0)
+            .cpu()
+            .numpy()
+            * xyz_scale
+        )
+        pcd_motion_mask = (
+            current_pc.get(
+                "motion_mask",
+                torch.zeros(
+                    current_pc["xyz"].shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device=current_pc["xyz"].device,
+                ),
+            )
+            .cpu()
+            .numpy()
+        )
         frames = []
         images = self.images
         for i, img in enumerate(images):
@@ -1258,6 +1418,8 @@ class FrameSyn(torch.nn.Module):
             "pcd_points": pcd_points,
             "pcd_colors": pcd_colors,
             "pcd_normals": pcd_normals,
+            "pcd_scene_flow": pcd_scene_flow,
+            "pcd_motion_mask": pcd_motion_mask,
             "camera_angle_x": camera_angle_x,
             "W": W,
             "H": H,
@@ -1267,6 +1429,26 @@ class FrameSyn(torch.nn.Module):
         pcd_points = current_pc["xyz"].permute(1, 0).cpu().numpy() * xyz_scale
         pcd_colors = current_pc["rgb"].cpu().numpy()
         pcd_normals = current_pc["normals"].cpu().numpy()
+        pcd_scene_flow = (
+            current_pc.get("scene_flow", torch.zeros_like(current_pc["xyz"]))
+            .permute(1, 0)
+            .cpu()
+            .numpy()
+            * xyz_scale
+        )
+        pcd_motion_mask = (
+            current_pc.get(
+                "motion_mask",
+                torch.zeros(
+                    current_pc["xyz"].shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device=current_pc["xyz"].device,
+                ),
+            )
+            .cpu()
+            .numpy()
+        )
         frames = []
         images = self.images_layer
         for i, img in enumerate(images):
@@ -1298,6 +1480,8 @@ class FrameSyn(torch.nn.Module):
             "pcd_points": pcd_points,
             "pcd_colors": pcd_colors,
             "pcd_normals": pcd_normals,
+            "pcd_scene_flow": pcd_scene_flow,
+            "pcd_motion_mask": pcd_motion_mask,
             "camera_angle_x": camera_angle_x,
             "W": W,
             "H": H,
@@ -1386,6 +1570,26 @@ class FrameSyn(torch.nn.Module):
         pcd_points = current_pc["xyz"].permute(1, 0).cpu().numpy() * xyz_scale
         pcd_colors = current_pc["rgb"].cpu().numpy()
         pcd_normals = current_pc["normals"].cpu().numpy()
+        pcd_scene_flow = (
+            current_pc.get("scene_flow", torch.zeros_like(current_pc["xyz"]))
+            .permute(1, 0)
+            .cpu()
+            .numpy()
+            * xyz_scale
+        )
+        pcd_motion_mask = (
+            current_pc.get(
+                "motion_mask",
+                torch.zeros(
+                    current_pc["xyz"].shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device=current_pc["xyz"].device,
+                ),
+            )
+            .cpu()
+            .numpy()
+        )
         frames = []
         images = self.images_layer
         for i, img in enumerate(images):
@@ -1420,6 +1624,8 @@ class FrameSyn(torch.nn.Module):
             "pcd_points": pcd_points,
             "pcd_colors": pcd_colors,
             "pcd_normals": pcd_normals,
+            "pcd_scene_flow": pcd_scene_flow,
+            "pcd_motion_mask": pcd_motion_mask,
             "camera_angle_x": camera_angle_x,
             "W": W,
             "H": H,
@@ -1480,6 +1686,8 @@ class FrameSyn(torch.nn.Module):
         imgto3D=False,
         object_id=None,
         ground_mask=None,
+        flow=None,
+        motion_mask=None,
     ):
         """
         Use self.image_latest and self.depth_latest to update current_pc.
@@ -1507,6 +1715,42 @@ class FrameSyn(torch.nn.Module):
         normals = rearrange(normals_world, "b c (h w) -> b c h w", h=512)
         new_normals = rearrange(normals, "b c h w -> (w h b) c")
         new_points_3d = kf_camera.unproject(self.points, point_depth)
+        if flow is not None:
+            flow_for_points = flow.detach().to(self.device)
+            flow_for_points = flow_for_points.squeeze(0).permute(2, 1, 0)
+            flow_points = (
+                torch.stack(
+                    torch.meshgrid(
+                        torch.arange(512, device=self.device).float() + 0.5,
+                        torch.arange(512, device=self.device).float() + 0.5,
+                        indexing="ij",
+                    ),
+                    -1,
+                )
+                + flow_for_points
+            )
+            flow_points = rearrange(flow_points, "h w c -> (h w) c")
+            flow_points_3d = kf_camera.unproject(flow_points, point_depth)
+            new_scene_flow = flow_points_3d - new_points_3d
+        else:
+            new_scene_flow = torch.zeros_like(new_points_3d)
+
+        if motion_mask is not None:
+            if isinstance(motion_mask, np.ndarray):
+                motion_mask_tensor = torch.from_numpy(motion_mask).to(self.device)
+            else:
+                motion_mask_tensor = motion_mask.to(self.device)
+            if motion_mask_tensor.ndim == 2:
+                motion_mask_tensor = motion_mask_tensor[None, None]
+            elif motion_mask_tensor.ndim == 3:
+                motion_mask_tensor = motion_mask_tensor[:, None]
+            new_motion_mask = rearrange(
+                motion_mask_tensor.bool(), "b c h w -> (w h b) c"
+            )
+        else:
+            new_motion_mask = torch.zeros(
+                new_points_3d.shape[0], 1, dtype=torch.bool, device=self.device
+            )
 
         image_points_3d = new_points_3d
         image_points_3d = rearrange(
@@ -1521,6 +1765,8 @@ class FrameSyn(torch.nn.Module):
             new_points_3d = new_points_3d[extract_mask]
             new_colors = new_colors[extract_mask]
             new_normals = new_normals[extract_mask]
+            new_scene_flow = new_scene_flow[extract_mask]
+            new_motion_mask = new_motion_mask[extract_mask]
 
             if ground_mask is not None:
                 ground_mask = rearrange(ground_mask, "b c h w -> (w h b) c")[:, 0].bool()
@@ -2082,6 +2328,12 @@ class FrameSyn(torch.nn.Module):
             faces = torch.tensor(faces).long().to(self.device)
             self.object_gaussians_faces[object_id] = faces
 
+        if new_scene_flow.shape[0] != new_points_3d.shape[0]:
+            new_scene_flow = torch.zeros_like(new_points_3d)
+            new_motion_mask = torch.zeros(
+                new_points_3d.shape[0], 1, dtype=torch.bool, device=self.device
+            )
+
         self.update_current_pc(
             new_points_3d,
             new_colors,
@@ -2090,6 +2342,8 @@ class FrameSyn(torch.nn.Module):
             object_id=object_id,
             object_mask=valid_mask,
             ground_mask=ground_mask,
+            scene_flow=new_scene_flow,
+            motion_mask=new_motion_mask,
         )
 
 
@@ -3923,4 +4177,3 @@ class KeyframeGen(FrameSyn):
         self.rendered_images.append(self.rendered_image_latest)
         self.rendered_depths.append(self.rendered_depth_latest)
         self.sky_mask_list.append(~self.sky_mask_latest.bool())
-

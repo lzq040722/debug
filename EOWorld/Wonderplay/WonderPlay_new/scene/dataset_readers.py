@@ -413,10 +413,34 @@ def readDataInfo(traindata, white_background):
 
     nerf_normalization = getNerfppNorm(train_cameras)
 
+    pcd_points = traindata['pcd_points'].T
+    pcd_scene_flow = traindata.get('pcd_scene_flow', np.zeros_like(pcd_points))
+    if pcd_scene_flow.shape != pcd_points.shape:
+        pcd_scene_flow = pcd_scene_flow.T
+    pcd_motion_mask = traindata.get(
+        'pcd_motion_mask',
+        np.zeros((pcd_points.shape[0], 1), dtype=bool),
+    )
+    pcd_motion_mask = np.asarray(pcd_motion_mask)
+    if pcd_motion_mask.ndim == 1:
+        pcd_motion_mask = pcd_motion_mask[:, None]
+
     try:
-        pcd = BasicPointCloud(points=traindata['pcd_points'].T, colors=traindata['pcd_colors'], normals=traindata['pcd_normals'])
+        pcd = BasicPointCloud(
+            points=pcd_points,
+            colors=traindata['pcd_colors'],
+            normals=traindata['pcd_normals'],
+            scene_flow=pcd_scene_flow,
+            motion_mask=pcd_motion_mask,
+        )
     except:
-        pcd = BasicPointCloud(points=traindata['pcd_points'].T, colors=traindata['pcd_colors'], normals=None)
+        pcd = BasicPointCloud(
+            points=pcd_points,
+            colors=traindata['pcd_colors'],
+            normals=None,
+            scene_flow=pcd_scene_flow,
+            motion_mask=pcd_motion_mask,
+        )
 
     
     scene_info = SceneInfo(point_cloud=pcd,
