@@ -1,0 +1,150 @@
+# Object motion scene configuration template.
+# This file is merged with examples/base-config.yaml at runtime.
+# Replace the angle-bracket placeholders before running.
+
+# ========== Scene I/O ==========
+# Scene identifier. Use a short directory-safe name, for example: lake_boat.
+scene_name: "<scene_name>"
+
+# Must match the asset directory: examples/imgs/<example_name>/image.png.
+# Keeping this identical to scene_name is recommended.
+example_name: "<scene_name>"
+input_image: "image.png"
+data_path: "examples/imgs"
+examples_dir: "examples/imgs/<scene_name>"
+sky_image_dir: "examples/imgs/<scene_name>"
+
+# Output and working directories for this scene.
+runs_dir: "3d_result/wonderplay/<scene_name>"
+work_dir: "3d_result/wonderplay/<scene_name>"
+
+# ========== Runtime ==========
+seed: 1
+frames: 5
+device: cuda
+debug: True
+
+# ========== Keyframe Generation ==========
+num_scenes: 16
+use_gpt: False
+kf2_upsample_coef: 4
+skip_interp: True
+skip_gen: False
+enable_regenerate: False
+
+# ========== Decoder / Depth ==========
+finetune_decoder_gen: False
+finetune_decoder_interp: False
+finetune_depth_model: True
+
+# Venice object motion uses Marigold with these depth/camera scales; adjust for
+# indoor scenes, narrow FOV images, or unstable depth boundaries.
+depth_model: marigold
+depth_model_indoor: False
+without_heuristic_set_depth_image: True
+
+# ========== Inpainting ==========
+inpainting_resolution_gen: 512
+inpainting_resolution_interp: 512
+stable_diffusion_checkpoint: "sd2-community/stable-diffusion-2-inpainting"
+negative_inpainting_prompt: "collage, text, writings, signs, text, white border, photograph border, artifacts, blur, blurry, foggy, fog, bad quality, distortions, distorted image, watermark, signature, fisheye look"
+
+# Describe what should replace removed objects during background inpainting.
+# Example: "river, water, distant shore"
+base_inpainting_prompt: "<background content after object removal>"
+
+# Describe content that must not reappear in the inpainted background.
+# Example: "boat, ship, people"
+base_inpainting_negative_prompt: "<content to exclude from background>"
+
+# ========== Camera / Scene Geometry ==========
+# Must have num_scenes entries. Venice pans right for 8 views and left for 8 views.
+rotation_path: [2, 2, 2, 2, 2, 2, 2, 2, -2, -2, -2, -2, -2, -2, -2, -2]
+camera_speed_multiplier_rotation: 0.3
+rotation_range: 0.37
+init_focal_length: 970
+
+camera_speed: 0.001
+fg_depth_range: 0.015
+depth_shift: 0.001
+sky_hard_depth: 0.02
+
+gen_sky: False
+gen_layer: True
+refine_depth_conditioning: False
+sky_example_name: "<scene_name>"
+
+# Non-empty ADE20K semantic IDs treated as foreground during layer separation.
+# Determine these from the first run's segmentation results. Venice boat: [76].
+foreground_ids: [<semantic_id>]
+ground_ids: []
+
+# ========== Motion Type Configuration ==========
+# Select the Genesis object-physics branch.
+motion_type: "object"
+
+# Describe the object and its intended motion for the video refinement stage.
+# Example: "a boat floating and rocking on the river"
+text_prompt: "<object and motion description>"
+
+# ========== Object Reconstruction ==========
+# Reconstruct each segmented object as a 3D mesh for Genesis simulation.
+imgto3D: True
+imgto3d_method: "instantmesh"
+
+# Fraction of the reconstruction image occupied by the foreground object.
+# A practical starting value is 0.85; increase it for a small source object.
+imgto3d_fg_ratio: 0.85
+
+# InstantMesh reconstruction resolution and optimization iterations.
+# 128 and 3500 are the current Venice defaults.
+imgto3d_resolution: 128
+imgto3d_optimization_iters: 3500
+
+# Number of independently simulated foreground objects.
+object_num: <object_count>
+
+# SAM mask IDs for each object, in the same order as material_types.
+# One object: [3]
+# Two objects: [3, 8]
+# One object assembled from masks 3 and 4, plus a second object: [[3, 4], 8]
+object_split_mask_sam_ids: [<sam_mask_id>]
+
+# ========== Genesis Physics ==========
+# Function name defined in WonderPlay_new/simulator/genesis_functions.py.
+# Example: force_venice_1
+force_function_name: "<existing_force_function_name>"
+
+# One Genesis material per object; list length must equal object_num.
+# Example for one object: ["rigid"]
+# Example for two objects: ["rigid", "rigid"]
+material_types: ["<material_for_object_0>"]
+
+# Rigid coupling defaults copied from Venice. Tune lower for smoother sliding or
+# higher for stronger contact response.
+rigid_friction: 0.05
+rigid_coup_friction: 0.05
+rigid_coup_softness: 0.1
+
+collision_force_with_env: False
+collision_force_with_obj: False
+collision_constraint_with_env: True
+collision_constraint_with_obj: True
+
+# Requested simulation length and physics time step.
+# Current practical starting values are 50 and 0.01.
+simulation_iterations: 2
+simulation_steps: 50
+dt: 0.01
+
+# Optional manual boundary override. During object runs, run_genesis.py may reset
+# y_min from the reconstructed ground layer.
+boundary_rules: {y_min: -0.4}
+
+# Environment-motion fields are ignored when motion_type="object", but keeping
+# the section here makes switching branches easy.
+environment_motion:
+  scale_factor: 0.5
+  sam_prompt: "<moving_region_description>"
+  fixed_hints:
+    - [<start_x>, <start_y>, <end_x>, <end_y>]

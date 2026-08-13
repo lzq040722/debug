@@ -8,9 +8,13 @@ import torch
 from einops import rearrange
 from tqdm import tqdm
 
-sys.path.append(rp.get_path_parent(__file__))
-import raft
-from background_remover import BackgroundRemover
+try:
+    from . import raft
+    from .background_remover import BackgroundRemover
+except ImportError:
+    sys.path.insert(0, rp.get_path_parent(__file__))
+    import raft
+    from background_remover import BackgroundRemover
 
 def unique_pixels(image):
     """

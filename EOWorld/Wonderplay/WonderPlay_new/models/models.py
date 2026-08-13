@@ -3771,6 +3771,25 @@ class KeyframeGen(FrameSyn):
         inpaint_mask = (
             self.mask_disocclusion > 0.5
         )  # Erode a bit to prevent over-inpaint
+        segmentation_dir = self.run_dir / "segmentation"
+        segmentation_dir.mkdir(exist_ok=True, parents=True)
+        hole_vis = self.image_latest_init.clone()
+        hole_vis = hole_vis * (~inpaint_mask).float()
+        ToPILImage()(hole_vis[0]).save(segmentation_dir / "foreground_removed_hole.png")
+        overlay = self.image_latest_init.clone()
+        overlay[:, 0] = torch.where(
+            inpaint_mask[:, 0], torch.ones_like(overlay[:, 0]), overlay[:, 0]
+        )
+        overlay[:, 1:] = torch.where(
+            inpaint_mask.expand(-1, 2, -1, -1),
+            overlay[:, 1:] * 0.25,
+            overlay[:, 1:],
+        )
+        ToPILImage()(overlay[0]).save(segmentation_dir / "foreground_removed_overlay.png")
+        print(
+            "[INFO] Saved foreground-removal visualizations to "
+            f"{segmentation_dir / 'foreground_removed_hole.png'}"
+        )
         self.inpaint(
             self.image_latest_init,
             inpaint_mask=inpaint_mask,
@@ -3798,6 +3817,14 @@ class KeyframeGen(FrameSyn):
                 )  # keep it slightly dilated to prevent dirty artifacts
         self.image_latest = soft_stitching(
             inpainter_output, self.image_latest_init, stitch_mask, sigma=1, blur_size=3
+        )
+        ToPILImage()(self.image_latest[0]).save(
+            segmentation_dir / "background_inpainted.png"
+        )
+        print(
+            "[INFO] Foreground/background separation and background inpainting complete. "
+            f"Mask: {segmentation_dir / 'sam_mask_disocclusion.png'}, "
+            f"inpainted background: {segmentation_dir / 'background_inpainted.png'}"
         )
         # ToPILImage()(grad_magnitude_mask.float()).save(self.run_dir / 'images' / 'layer' / f'{self.kf_idx:02d}_grad_magnitude_mask.png')
         # ToPILImage()((self.image_latest.cpu() * mask_disocclusion.float())[0]).save(self.run_dir / 'images' / 'layer' / f'{self.kf_idx:02d}_mask_disocclusion.png')

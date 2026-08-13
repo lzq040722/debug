@@ -69,7 +69,7 @@ from util.utils import (
     crop_to_square,
     convert_pt3d_cam_to_3dgs_cam,
 )
-from util.stable_diffusion_inpaint import StableDiffusionInpaintPipeline
+from util.image_edit_inpaint import ImageEditInpaintPipeline
 from util.segment_utils import create_mask_generator_repvit
 from models.models import KeyframeGen, save_point_cloud_as_ply, debug_vis_func
 from arguments import GSParams, CameraParams
@@ -701,23 +701,17 @@ def run(config, dt_string=None):
 
     mask_generator = create_mask_generator_repvit()
 
-    inpaint_checkpoint, inpaint_is_local = _cached_model_source(
-        config["stable_diffusion_checkpoint"],
-        fallback_repo_id="sd2-community/stable-diffusion-2-inpainting",
+    image_edit_checkpoint = config.get(
+        "image_edit_checkpoint", "/root/autodl-tmp/huggingface/hub"
     )
-    inpainter_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
-        inpaint_checkpoint,
-        safety_checker=None,
+    print(f"[INFO] Loading Image-Edit inpainter from {image_edit_checkpoint} ...")
+    inpainter_pipeline = ImageEditInpaintPipeline.from_pretrained(
+        image_edit_checkpoint,
         torch_dtype=torch.bfloat16,
-        cache_dir=str(_HF_HUB_CACHE),
-        local_files_only=inpaint_is_local,
-        **_fp16_safetensors_kwargs(inpaint_checkpoint),
+        local_files_only=True,
     ).to(config["device"])
-    inpainter_pipeline.scheduler = DDIMScheduler.from_config(
-        inpainter_pipeline.scheduler.config
-    )
-    inpainter_pipeline.unet.set_attn_processor(AttnProcessor2_0())
-    inpainter_pipeline.vae.set_attn_processor(AttnProcessor2_0())
+    inpainter_pipeline.set_progress_bar_config(disable=None)
+    print("[INFO] Image-Edit inpainter loaded.")
 
     rotation_path = config["rotation_path"][: config["num_scenes"]]
     assert len(rotation_path) == config["num_scenes"]

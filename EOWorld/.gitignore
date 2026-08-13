@@ -43,8 +43,10 @@ output/
 results/
 3d_result/
 3d_result_/
+3d_result*/
 **/3d_result/
 **/3d_result_/
+**/3d_result*/
 tmp_mesh/
 snapshot_fw.dump
 
@@ -55,6 +57,7 @@ snapshot_fw.dump
 *.safetensors
 *.onnx
 *.bin
+*.zip
 *.pkl
 *.pickle
 checkpoints/
@@ -63,6 +66,8 @@ ckpts/
 **/ckpts/
 lora_models/
 **/lora_models/
+models/*/
+**/models/*/
 
 # Large generated arrays and render artifacts
 *.npy
@@ -83,6 +88,9 @@ Wonderplay/INTEGRATION_PLAN.md
 Wonderplay/INTEGRATION_PLAN_MINIMAL.md
 Wonderplay/INTEGRATION_SUMMARY.md
 Wonderplay/PROJECT_COMPLETE.md
+Wonderplay/output_image_edit_*.png
+Wonderplay/*.backup_*/
+Wonderplay/Wan2.1.backup_*/
 
 # Nested Git metadata should never be uploaded as files
 **/.git/

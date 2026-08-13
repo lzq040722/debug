@@ -1,0 +1,93 @@
+# Environment motion scene configuration template.
+# This file is merged with examples/base-config.yaml at runtime.
+# Replace the angle-bracket placeholders before running.
+
+# ========== Scene I/O ==========
+# Scene identifier. Use a short directory-safe name, for example: flowing_river.
+scene_name: "<scene_name>"
+
+# Must match the asset directory: examples/imgs/<example_name>/image.png.
+# Keeping this identical to scene_name is recommended.
+example_name: "<scene_name>"
+input_image: "image.png"
+data_path: "examples/imgs"
+examples_dir: "examples/imgs/<scene_name>"
+sky_image_dir: "examples/imgs/<scene_name>"
+
+# Output and working directories for this scene.
+runs_dir: "3d_result/wonderplay/<scene_name>"
+work_dir: "3d_result/wonderplay/<scene_name>"
+
+# ========== Runtime ==========
+seed: 1
+frames: 5
+device: cuda
+debug: True
+
+# ========== Keyframe Generation ==========
+num_scenes: 16
+use_gpt: False
+kf2_upsample_coef: 4
+skip_interp: True
+skip_gen: False
+enable_regenerate: False
+
+# ========== Decoder / Depth ==========
+finetune_decoder_gen: False
+finetune_decoder_interp: False
+finetune_depth_model: True
+
+# Venice uses Marigold with these depth/camera scales; they are good defaults for
+# outdoor water scenes and can be tuned per image.
+depth_model: marigold
+depth_model_indoor: False
+without_heuristic_set_depth_image: True
+
+# ========== Inpainting ==========
+inpainting_resolution_gen: 512
+inpainting_resolution_interp: 512
+stable_diffusion_checkpoint: "sd2-community/stable-diffusion-2-inpainting"
+negative_inpainting_prompt: "collage, text, writings, signs, text, white border, photograph border, artifacts, blur, blurry, foggy, fog, bad quality, distortions, distorted image, watermark, signature, fisheye look"
+
+# ========== Camera / Scene Geometry ==========
+# Must have num_scenes entries. Venice pans right for 8 views and left for 8 views.
+rotation_path: [2, 2, 2, 2, 2, 2, 2, 2, -2, -2, -2, -2, -2, -2, -2, -2]
+camera_speed_multiplier_rotation: 0.3
+rotation_range: 0.37
+init_focal_length: 970
+
+camera_speed: 0.001
+fg_depth_range: 0.015
+depth_shift: 0.001
+sky_hard_depth: 0.02
+
+gen_sky: False
+gen_layer: False
+refine_depth_conditioning: False
+sky_example_name: "<scene_name>"
+
+# ========== Motion Type Configuration ==========
+# Select the LivingWorld HashGrid environment-motion branch.
+motion_type: "environment"
+
+# Describe the environment and its intended motion for video refinement.
+# Example: "river water flowing steadily downstream"
+text_prompt: "<environment and motion description>"
+
+# Environment motion configuration.
+environment_motion:
+  # Motion amplitude. Venice uses 0.5; try 0.5-1.0 first, then increase for
+  # faster water, smoke, fire, grass, or clouds.
+  scale_factor: <motion_strength>
+
+  # Text used by SAM3 to select the moving region.
+  # Examples: "water", "smoke", "grass", "cloud", or "water, river".
+  sam_prompt: "<moving_region_description>"
+
+  # Required motion arrows in 512x512 image coordinates.
+  # Each item is [start_x, start_y, end_x, end_y].
+  # Add arrows across representative parts of the moving region.
+  fixed_hints:
+    - [<start_x>, <start_y>, <end_x>, <end_y>]
+    - [<start_x>, <start_y>, <end_x>, <end_y>]
+    - [<start_x>, <start_y>, <end_x>, <end_y>]
