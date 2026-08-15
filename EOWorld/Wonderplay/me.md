@@ -46,10 +46,10 @@ b. 把VACE 官方得到光流信息的流程加入到现有的方法当中。（
 
 python vace/vace_preproccess.py \
   --task flow \
-  --video /root/autodl-tmp/EOWorld/Wonderplay/3d_result/wonderplay/alpine/Gen-11-08_23-26-15/simulation/traj_00/render_video.mp4 \
-  --pre_save_dir /root/autodl-tmp/EOWorld/Wonderplay/3d_result/wonderplay/alpine/Gen-11-08_23-26-15/simulation/vace_flow
+  --video /root/autodl-tmp/EOWorld/Wonderplay/3d_result/wonderplay/venice/Gen-14-08_20-43-06/simulation/traj_00/render_video.mp4 \
+  --pre_save_dir /root/autodl-tmp/EOWorld/Wonderplay/3d_result/wonderplay/venice/Gen-14-08_20-43-06/simulation/vace_flow
 
-python Wan2.1/generate.py \
+python Wan2.1.backup_20260810_215736/generate.py \
   --task vace-14B \
   --size  832*480 \
   --ckpt_dir /root/autodl-tmp/huggingface/Wan2.1-VACE-14B \
@@ -57,15 +57,15 @@ python Wan2.1/generate.py \
   --src_video /root/autodl-tmp/EOWorld/Wonderplay/3d_result/wonderplay/alpine/Gen-11-08_23-26-15/simulation/vace_flow/src_video-flow.mp4 \
   --src_ref_images 3d_result/wonderplay/alpine/Gen-11-08_23-26-15/simulation/gt.png \
   --frame_num 49 \
-  --save_file 3d_result/wonderplay/alpine/Gen-11-08_23-26-15/test_flow_vace.mp4 \
-  --init_video 3d_result/wonderplay/alpine/Gen-11-08_23-26-15/simulation/traj_00/render_video.mp4 \
+  --save_file 3d_result/wonderplay/alpine/Gen-11-08_23-26-15/test_flow_vace_wan2.1.mp4 \
+  --init_video3d_result/wonderplay/alpine/Gen-11-08_23-26-15/simulation/traj_00/render_video.mp4 \
   --sdedit_strength 0.5 \
 
 
 ffmpeg -y \
   -framerate 8 \
   -pattern_type glob \
-  -i '3d_result/wonderplay/venice_o/Gen-07-08_21-49-29/simulation/traj_00/frames/frame_*.png' \
+  -i '3d_result/wonderplay/venice/Gen-14-08_20-43-06/simulation/traj_00/frames/frame_*.png' \
   -vf "scale=832:480:force_original_aspect_ratio=decrease,pad=832:480:(ow-iw)/2:(oh-ih)/2" \
   -c:v libx264 \
   -preset slow \
@@ -86,9 +86,9 @@ PY
 
 转换成realwonder 所需要格式：
 CUDA_VISIBLE_DEVICES=0 python prepare_realwonder_input.py \
-  --simulation_dir 3d_result/wonderplay/alpine/Gen-11-08_23-26-15/simulation \
+  --simulation_dir 3d_result/wonderplay/venice/Gen-14-08_20-43-06/simulation \
   --traj_id 0 \
-  --output_dir /root/autodl-tmp/RealWonder/input_data/alpine/final_sim \
+  --output_dir /root/autodl-tmp/RealWonder/input_data/venice/final_sim \
   --num_output_frames 12 \
   --flow_format normalized \
   --overwrite
@@ -96,8 +96,8 @@ CUDA_VISIBLE_DEVICES=0 python prepare_realwonder_input.py \
 跑realwonder 视频生成模型：
 CUDA_VISIBLE_DEVICES=0 python infer_sim.py \
   --checkpoint_path 'ckpts/Realwonder-Distilled-AR-I2V-Flow/sink_size=1-attn_size=21-frame_per_block=3-denoising_steps=4/step=000800.pt' \
-  --sim_data_path input_data/alpine/final_sim \
-  --output_path input_data/venice/final_sim/realwonder_output1.mp4 \
+  --sim_data_path input_data/venice/final_sim \
+  --output_path input_data/venice/final_sim/realwonder_output2.mp4 \
   --eval_degradation 0.5 \
   --local_attn_size 21 \
   --seed 42
@@ -108,3 +108,8 @@ final_hint_start_y-3d [array([384.], dtype=float32), array([375.], dtype=float32
 final_hint_end_y-3d [array([473.], dtype=float32), array([449.], dtype=float32), array([433.], dtype=float32)]
 
 9. SD-Inpaint 的作用是生成一张没有被前景物体遮挡的keyframe/baselayer，基于这个思想在环境运动分支里边应该移除前景物体，然后补全整个环境，再把整个作用力施加在环境中。
+
+10. Git 上传教程
+git add.
+git commit -m ' ' 
+git push

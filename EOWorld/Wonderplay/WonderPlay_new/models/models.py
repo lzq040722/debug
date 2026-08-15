@@ -711,6 +711,7 @@ class FrameSyn(torch.nn.Module):
         negative_prompt=None,
         mask_strategy=np.min,
         diffusion_steps=50,
+        image_edit_input=None,
     ):
         # set resolution
         if self.inpainting_resolution > 512 and rendered_image.shape[-1] == 512:
@@ -770,11 +771,14 @@ class FrameSyn(torch.nn.Module):
                 else self.negative_inpainting_prompt
             )
 
+        image_edit_image = init_image
+        if image_edit_input is not None:
+            image_edit_image = Image.open(image_edit_input).convert("RGB")
+
         inpainted_image = self.inpainting_pipeline(
             prompt="" if self.use_noprompt else self.inpainting_prompt,
             negative_prompt=negative_prompt,
-            image=init_image,
-            mask_image=mask_image,
+            image=image_edit_image,
             num_inference_steps=diffusion_steps,
             guidance_scale=0 if self.use_noprompt else 7.5,
             height=self.inpainting_resolution,
@@ -3645,11 +3649,11 @@ class KeyframeGen(FrameSyn):
         image_pil = ToPILImage()(self.image_latest.squeeze())
         image_np = np.array(image_pil)
         sam_masks = self.mask_generator.generate(image_np)
-        sam_masks_np = []
+        sam_masks_np = {}
         for sid, sam_mask in enumerate(sam_masks):
             if sam_mask['area'] < 100:
                 continue
-            sam_masks_np.append(sam_mask['segmentation'])   # (512, 512) bool numpy array
+            sam_masks_np[sid] = sam_mask['segmentation']   # (512, 512) bool numpy array
             sam_mask = sam_mask['segmentation'] * 255
             sam_mask = sam_mask.astype(np.uint8)
             cv2.imwrite((self.run_dir / f"segmentation/sam_mask_{sid:02d}.png").as_posix(), sam_mask)
@@ -3729,15 +3733,18 @@ class KeyframeGen(FrameSyn):
             self.object_masks = []
             for object_number_id, sid in enumerate(object_split_mask_sam_ids):
                 combined_mask = np.full((512, 512), False, dtype=bool)
-                try:
-                    len_list = len(sid)
-                    for siid in sid:
-                        mask_disocclusion |= sam_masks_np[siid]
-                        combined_mask |= sam_masks_np[siid]
-                    # if the len(sid) == 0, you can pass this and should have an existing mask in tmp/
-                except:
-                    mask_disocclusion |= sam_masks_np[sid]
-                    combined_mask |= sam_masks_np[sid]
+                selected_sids = sid if isinstance(sid, (list, tuple)) else [sid]
+                for siid in selected_sids:
+                    if siid not in sam_masks_np:
+                        available = ", ".join(str(k) for k in sorted(sam_masks_np.keys()))
+                        raise ValueError(
+                            f"object_split_mask_sam_ids contains SAM mask id {siid}, "
+                            f"but available saved SAM ids are [{available}]. "
+                            "Choose ids from segmentation/sam_mask_XX_rgb.png."
+                        )
+                    mask_disocclusion |= sam_masks_np[siid]
+                    combined_mask |= sam_masks_np[siid]
+                # if selected_sids is empty, you can pass this and should have an existing mask in tmp/
                 
                 # also if in examples_dir, there is {example_name}_object_{id}.png, then also use it
                 _examples_dir = self.config.get("examples_dir", os.path.join("examples", "imgs", self.config["example_name"]))
@@ -3797,6 +3804,7 @@ class KeyframeGen(FrameSyn):
             negative_prompt=inpainting_negative_prompt,
             mask_strategy=np.max,
             diffusion_steps=50,
+            image_edit_input=segmentation_dir / "foreground_removed_hole.png",
         )
         inpainter_output = self.image_latest
 

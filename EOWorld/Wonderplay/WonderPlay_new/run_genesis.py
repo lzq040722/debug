@@ -319,8 +319,10 @@ def prepare_environment_motion_fields(save_dir, config):
             masks_list.append(masks_np.astype(bool))
 
     if len(masks_list) == 0:
-        print(f"[environment_motion_prepare] WARNING: SAM3 returned no masks for '{sam_prompt}'")
-        motion_mask_2d = np.ones((512, 512), dtype=bool)
+        raise RuntimeError(
+            f"SAM3 returned no masks for environment_motion.sam_prompt='{sam_prompt}'. "
+            "Please adjust the prompt so it selects the moving environment region."
+        )
     else:
         motion_mask_2d = np.any(np.concatenate(masks_list, axis=0), axis=0)
 
@@ -330,10 +332,18 @@ def prepare_environment_motion_fields(save_dir, config):
         f"{mask_area} pixels ({mask_area / (512 * 512) * 100:.2f}%)"
     )
     if mask_area == 0:
-        print("[environment_motion_prepare] WARNING: empty SAM3 mask, falling back to full-image motion")
-        motion_mask_2d = np.ones((512, 512), dtype=bool)
+        raise RuntimeError(
+            f"SAM3 produced an empty mask for environment_motion.sam_prompt='{sam_prompt}'."
+        )
 
     Image.fromarray((motion_mask_2d.astype(np.uint8) * 255)).save(save_dir / "sam3_mask.png")
+    overlay = np.array(image_pil.convert("RGB"))
+    overlay_mask = motion_mask_2d.astype(bool)
+    overlay[overlay_mask] = (
+        overlay[overlay_mask].astype(np.float32) * 0.35
+        + np.array([255, 40, 40], dtype=np.float32) * 0.65
+    ).astype(np.uint8)
+    Image.fromarray(overlay).save(save_dir / "sam3_mask_overlay.png")
 
     print(f"[environment_motion_prepare] Step 2: Cinemagraphy 2D flow estimation with {len(fixed_hints)} hints")
     hints_array = np.array(fixed_hints)
@@ -429,7 +439,10 @@ def environment_motion_rendering(gaussians, scene, save_dir, config, video_gen_f
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_cam = viewpoint_stack[0]
-    gt_image = viewpoint_cam.original_image.cuda()
+    if getattr(kf_gen, "images", None):
+        gt_image = kf_gen.images[-1][0].detach().cpu()
+    else:
+        gt_image = viewpoint_cam.original_image.detach().cpu()
     ToPILImage()(gt_image).save(save_dir / "gt.png")
     text_prompt = config.get("text_prompt", " ")
     with open((save_dir / "text_prompt.txt").as_posix(), "w") as f:
@@ -980,41 +993,7 @@ def run(config, dt_string=None):
             particle_num_base = gaussians.get_xyz_all.shape[0] - particle_num_sky
         traindata_list = []
 
-    # ---------- Environment motion early exit ----------
-    # For motion_type == "environment", we don't need object 3DGS training or the
-    # physics Simulator. The base + sky gaussians we already trained are enough
-    # to drive LivingWorld's HashGrid motion field. Skip everything below to
-    # avoid touching object-only code paths (empty _xyz, Simulator, bbox, ...).
-    if motion_type == "environment":
-        print("=" * 60)
-        print("Environment Motion (LivingWorld HashGrid) - skipping object training and physics")
-        print("=" * 60)
-        tdgs_cam = convert_pt3d_cam_to_3dgs_cam(
-            kf_gen.get_camera_at_origin(), xyz_scale=xyz_scale
-        )
-        gaussians.set_inscreen_points_to_visible(tdgs_cam)
-
-        if save_dir_sim is None:
-            save_dir_sim = kf_gen.run_dir / "simulation"
-            save_dir_sim.mkdir(parents=True, exist_ok=True)
-        save_dir_3d = kf_gen.run_dir / "3d_results"
-        save_dir_3d.mkdir(parents=True, exist_ok=True)
-        gaussians.save_ply_for_3dgs((save_dir_3d / "gaussians.ply").as_posix())
-
-        if "scene" not in locals():
-            scene = Scene(traindata_layer, gaussians, opt)
-
-        environment_motion_rendering(
-            gaussians,
-            scene,
-            save_dir_sim,
-            config,
-            video_gen_fps=8,
-            sky_gaussians=sky_gaussians,
-        )
-        print("Scene compositional reconstruction and environment motion finished.")
-        return
-    # ---------- End environment motion early exit ----------
+    environment_scene = scene if "scene" in locals() else Scene(traindata_layer, gaussians, opt)
 
     gaussians = GaussianModel(sh_degree=0, previous_gaussian=gaussians)
     i = 0
@@ -1045,9 +1024,10 @@ def run(config, dt_string=None):
         )
         total_object_pts_num += object_pts_num
         object_pts_num_list.append(object_pts_num)
-        faces.append(train_data["faces"])
-        object_meshes_paths.append(train_data["mesh_path"])
-        object_meshes_translations.append(train_data["mesh_translation"])
+        if motion_type != "environment":
+            faces.append(train_data["faces"])
+            object_meshes_paths.append(train_data["mesh_path"])
+            object_meshes_translations.append(train_data["mesh_translation"])
         print(f"Object points number: {object_pts_num}")
 
     # dt_string = datetime.now().strftime("%d-%m_%H-%M-%S")
@@ -1067,6 +1047,35 @@ def run(config, dt_string=None):
     # here the boat gaussians are ready
     save_dir_3d = kf_gen.run_dir / "3d_results"
     save_dir_3d.mkdir(parents=True, exist_ok=True)
+
+    # ---------- Environment motion exit after layer/object reconstruction ----------
+    # Environment motion still needs object 3DGS when gen_layer=True so the object
+    # remains visible as a static layer while the environment/base points move.
+    if motion_type == "environment":
+        print("=" * 60)
+        print("Environment Motion (LivingWorld HashGrid) - skipping physics only")
+        print("=" * 60)
+        print(
+            "Environment reconstruction summary: "
+            f"sky={particle_num_sky}, base={particle_num_base}, "
+            f"object={particle_num_object}"
+        )
+        if save_dir_sim is None:
+            save_dir_sim = kf_gen.run_dir / "simulation"
+            save_dir_sim.mkdir(parents=True, exist_ok=True)
+        gaussians.save_ply_for_3dgs((save_dir_3d / "gaussians.ply").as_posix())
+        environment_motion_rendering(
+            gaussians,
+            environment_scene,
+            save_dir_sim,
+            config,
+            video_gen_fps=8,
+            sky_gaussians=sky_gaussians,
+        )
+        print("Scene compositional reconstruction and environment motion finished.")
+        return
+    # ---------- End environment motion exit ----------
+
     # sim = 'debug'
     if sim is None:
         xyz_obj, xyz_env = (

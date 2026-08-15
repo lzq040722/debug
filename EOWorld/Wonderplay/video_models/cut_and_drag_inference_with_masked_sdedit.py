@@ -483,7 +483,7 @@ def run_pipe(
         # generator=torch.Generator(device=device).manual_seed(42),
     ).frames[0]
 
-    export_to_video(video, output_mp4_path, fps=24)
+    export_to_video(video, output_mp4_path, fps=8)
 
     frames_dir = os.path.join(os.path.dirname(output_mp4_path.replace(".mp4", "")), os.path.basename(output_mp4_path).replace(".mp4", ""))
     os.makedirs(frames_dir, exist_ok=True)

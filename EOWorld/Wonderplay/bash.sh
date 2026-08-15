@@ -12,6 +12,6 @@ source /root/miniconda3/etc/profile.d/conda.sh
 conda activate /root/autodl-tmp/myenv/wp   
 
 #stage 1
-python WonderPlay_new/run_genesis.py --config examples/configs/alpine.yaml --prefix example
+python WonderPlay_new/run_genesis.py --config examples/configs/venice.yaml --prefix example
 #stage 2
-python WonderPlay_new/run_video_model.py --input_folder 3d_result/wonderplay/alpine/Gen-11-08_23-26-15/simulation --output_folder 3d_result/wonderplay/alpine/Gen-11-08_23-26-15/output_video --sdedit_strengths 0.85
+python WonderPlay_new/run_video_model.py --input_folder 3d_result/wonderplay/venice/Gen-14-08_20-43-06/simulation --output_folder 3d_result/wonderplay/venice/Gen-14-08_20-43-06/output_video --sdedit_strengths 0.85

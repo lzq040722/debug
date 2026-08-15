@@ -1,6 +1,5 @@
 from types import SimpleNamespace
 
-import numpy as np
 import torch
 from PIL import Image
 from torchvision.transforms import ToTensor
@@ -39,15 +38,6 @@ class ImageEditInpaintPipeline:
         if hasattr(self.pipeline, "set_progress_bar_config"):
             self.pipeline.set_progress_bar_config(*args, **kwargs)
 
-    @staticmethod
-    def _masked_rgba(image, mask_image):
-        image = image.convert("RGBA")
-        mask = np.array(mask_image.convert("L"))
-        alpha = np.full(mask.shape, 255, dtype=np.uint8)
-        alpha[mask > 0] = 0
-        image.putalpha(Image.fromarray(alpha))
-        return image
-
     def __call__(
         self,
         prompt,
@@ -59,20 +49,14 @@ class ImageEditInpaintPipeline:
         generator=None,
         **kwargs,
     ):
-        if image is None or mask_image is None:
-            raise ValueError("ImageEditInpaintPipeline requires image and mask_image.")
+        if image is None:
+            raise ValueError("ImageEditInpaintPipeline requires an image.")
 
-        if prompt:
-            edit_prompt = (
-                "Remove the object in the transparent masked area and fill it with "
-                f"realistic background content matching: {prompt.strip()}."
-            )
-        else:
-            edit_prompt = "Fill the transparent masked area with realistic background."
-        if negative_prompt:
-            edit_prompt = f"{edit_prompt}. Do not include: {negative_prompt}."
+        edit_prompt = prompt.strip() if prompt else ""
 
-        edit_image = self._masked_rgba(image, mask_image)
+        # Qwen Image-Edit accepts RGB images only. The hole image is already
+        # prepared by the caller, so mask_image is intentionally unused.
+        edit_image = image.convert("RGB")
         if generator is None:
             generator = torch.manual_seed(torch.initial_seed())
 
