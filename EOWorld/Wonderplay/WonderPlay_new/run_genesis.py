@@ -73,13 +73,21 @@ from util.image_edit_inpaint import ImageEditInpaintPipeline
 from util.segment_utils import create_mask_generator_repvit
 from models.models import KeyframeGen, save_point_cloud_as_ply, debug_vis_func
 from arguments import GSParams, CameraParams
-from gaussian_renderer import render, render_w_shift, render_w_shift_flow, render_w_shift_da
+from gaussian_renderer import (
+    proj_uv,
+    render,
+    render_interaction,
+    render_w_shift,
+    render_w_shift_flow,
+    render_w_shift_da,
+)
 from gaussian_renderer.living_world_render import render_MLP, pre_euler_integral
 from hashgrid import HashEncoderMotionModel
 from scene import Scene, GaussianModel
 from scene.cameras import Camera
 from utils.loss import l1_loss, ssim
 from utils.flow import visualize_flow_as_arrows, camera_traj
+from utils.vace_flow import save_vace_raft_flow
 from syncdiffusion.syncdiffusion_model import SyncDiffusion
 from simulator.diff_simulator_v3 import Simulator
 
@@ -280,11 +288,15 @@ def seeding(seed):
 
 # ========== Environment Motion Rendering Function ==========
 
-def prepare_environment_motion_fields(save_dir, config):
+def prepare_environment_motion_fields(save_dir, config, fixed_hints_override=None):
     """Estimate 2D motion fields and bind them to current_pc_latest before 3DGS training."""
     env_config = config.get('environment_motion', {})
     sam_prompt = env_config.get('sam_prompt', 'water')
-    fixed_hints = env_config.get('fixed_hints', [])
+    fixed_hints = (
+        fixed_hints_override
+        if fixed_hints_override is not None
+        else env_config.get('fixed_hints', [])
+    )
 
     if len(fixed_hints) == 0:
         raise ValueError("No fixed_hints in config, cannot estimate environment motion")
@@ -404,6 +416,511 @@ def prepare_environment_motion_fields(save_dir, config):
         f"std={scene_flow.std(dim=0).detach().cpu().numpy()}",
     )
     return flow_2d, motion_mask_2d
+
+
+class _InteractionMotionPointCloud:
+    """Minimal tensor view accepted by the existing HashGrid trainer."""
+
+    def __init__(self, xyz, scene_flow):
+        self.get_xyz_all = xyz
+        self.get_scene_flow_all = scene_flow
+
+
+def validate_interaction_config(config):
+    interaction = config.get("interaction", {})
+    direction = str(interaction.get("direction", "")).lower()
+    if direction not in {"env2obj", "obj2env"}:
+        raise ValueError(
+            "interaction.direction must be either 'env2obj' or 'obj2env'"
+        )
+    if int(config.get("object_num", 0)) != 1:
+        raise ValueError("Interaction V1 supports exactly one object")
+    if len(config.get("material_types", [])) != 1:
+        raise ValueError("Interaction V1 requires exactly one material type")
+    if direction == "env2obj" and config["material_types"][0] != "rigid":
+        raise ValueError("interaction.direction='env2obj' requires one rigid object")
+    velocity_scale = float(interaction.get("velocity_scale", 1.0))
+    if not np.isfinite(velocity_scale):
+        raise ValueError("interaction.velocity_scale must be finite")
+    return direction, velocity_scale
+
+
+def train_interaction_motion_model(config):
+    """Train on the inpainted environment points in Gaussian world units."""
+    current_pc = kf_gen.get_current_pc_latest()
+    xyz = current_pc["xyz"]
+    scene_flow = current_pc["scene_flow"]
+    motion_pc = _InteractionMotionPointCloud(xyz, scene_flow)
+    motion_model = HashEncoderMotionModel().to(config["device"])
+    return train_hashgrid(motion_pc, motion_model, iterations=100)
+
+
+def get_interaction_query_points(save_dir):
+    """Select inpainted environment points under the single object silhouette."""
+    object_mask_path = kf_gen.run_dir / "segmentation" / "object_00.png"
+    if not object_mask_path.exists():
+        raise FileNotFoundError(f"Object mask not found: {object_mask_path}")
+
+    object_mask = cv2.imread(object_mask_path.as_posix(), cv2.IMREAD_GRAYSCALE)
+    if object_mask is None:
+        raise RuntimeError(f"Failed to read object mask: {object_mask_path}")
+    object_mask = object_mask > 0
+
+    depth = kf_gen.depth_latest.detach()
+    if object_mask.shape != tuple(depth.shape[-2:]):
+        raise RuntimeError(
+            f"Object mask/depth resolution mismatch: {object_mask.shape} vs "
+            f"{tuple(depth.shape[-2:])}"
+        )
+    inpaint_environment_mask = (
+        (~kf_gen.sky_mask_latest.bool())
+        & torch.isfinite(depth)
+        & (depth > 1e-6)
+    )
+    object_mask_tensor = torch.from_numpy(object_mask).to(depth.device)[None, None]
+    interaction_mask = object_mask_tensor & inpaint_environment_mask
+
+    # update_current_pc_by_kf flattens masks in (w, h, b) order.
+    base_valid = ~kf_gen.sky_mask_latest.bool()
+    valid_flat = base_valid.permute(3, 2, 0, 1).reshape(-1)
+    query_flat = interaction_mask.permute(3, 2, 0, 1).reshape(-1)
+    query_in_environment = query_flat[valid_flat]
+
+    environment_xyz = kf_gen.get_current_pc_latest()["xyz"]
+    if environment_xyz.shape[0] != query_in_environment.shape[0]:
+        raise RuntimeError(
+            "Environment point/mask count mismatch: "
+            f"{environment_xyz.shape[0]} vs {query_in_environment.shape[0]}"
+        )
+    query_points = environment_xyz[query_in_environment]
+    if query_points.shape[0] == 0:
+        raise RuntimeError("Object mask contains no valid inpainted environment points")
+
+    Image.fromarray(
+        (interaction_mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
+    ).save(save_dir / "interaction_query_mask.png")
+    print(
+        f"[interaction] HashGrid query region: {query_points.shape[0]} environment points"
+    )
+    return query_points
+
+
+def renderer_displacement_to_genesis(displacement):
+    """Convert a vector from Gaussian/PyTorch3D axes to Genesis axes."""
+    return torch.stack(
+        [-displacement[0], displacement[2], displacement[1]], dim=0
+    )
+
+
+def generate_object_motion_hints(simulation_states, viewpoint_camera):
+    """Generate one image-space hint from adjacent visible object states."""
+    if len(simulation_states) < 2:
+        raise RuntimeError("obj2env requires at least two visible Genesis states")
+    object_key = "obj_0000"
+    xyz_start = simulation_states[0][object_key]["xyz"]
+    xyz_end = simulation_states[1][object_key]["xyz"]
+    center_start = xyz_start.mean(dim=0, keepdim=True)
+    center_end = xyz_end.mean(dim=0, keepdim=True)
+    uv_start = proj_uv(center_start, viewpoint_camera)[0]
+    uv_end = proj_uv(center_end, viewpoint_camera)[0]
+    if not torch.isfinite(uv_start).all() or not torch.isfinite(uv_end).all():
+        raise RuntimeError("Projected object motion hint contains NaN or Inf")
+
+    width = viewpoint_camera.image_width
+    height = viewpoint_camera.image_height
+    camera_rotation = torch.as_tensor(
+        viewpoint_camera.R.T,
+        dtype=center_start.dtype,
+        device=center_start.device,
+    )
+    camera_translation = torch.as_tensor(
+        viewpoint_camera.T,
+        dtype=center_start.dtype,
+        device=center_start.device,
+    )
+    for label, center, uv in (
+        ("start", center_start, uv_start),
+        ("end", center_end, uv_end),
+    ):
+        camera_center = (camera_rotation @ center.T).T + camera_translation
+        visible = (
+            camera_center[0, 2] > 1e-6
+            and 0 <= uv[0] < width
+            and 0 <= uv[1] < height
+        )
+        if not visible:
+            raise RuntimeError(f"obj2env {label} object center is outside the camera view")
+
+    hint = [
+        float(uv_start[0].item()),
+        float(uv_start[1].item()),
+        float(uv_end[0].item()),
+        float(uv_end[1].item()),
+    ]
+    displacement = np.asarray(hint[2:]) - np.asarray(hint[:2])
+    if np.linalg.norm(displacement) < 1e-4:
+        raise RuntimeError("Genesis object displacement is too small to form a motion hint")
+    print(f"[interaction] Generated obj2env motion hint: {hint}")
+    return [hint]
+
+
+def collect_interaction_states(
+    simulator,
+    save_dir,
+    simulation_steps,
+    num_frames,
+    gaussian_vis_freq=20,
+):
+    """Run Genesis once and retain the visible object states for unified rendering."""
+    genesis_dir = save_dir / "genesis"
+    genesis_dir.mkdir(parents=True, exist_ok=True)
+    states_dir = save_dir / "4d"
+    states_dir.mkdir(parents=True, exist_ok=True)
+
+    simulation_states = []
+    for sid in tqdm(range(simulation_steps), desc="Interaction Genesis simulation"):
+        sim_out = simulator.simulate_step(
+            sid,
+            simulation_steps,
+            genesis_dir,
+            gaussian_vis_freq,
+        )
+        if not sim_out:
+            continue
+
+        state = {
+            key: {"xyz": values["xyz"].detach().clone()}
+            for key, values in sim_out.items()
+        }
+        simulation_states.append(state)
+        np.savez(
+            states_dir / f"simulated_xyz_{sid:08d}.npz",
+            **{
+                key: values["xyz"].detach().cpu().numpy()
+                for key, values in state.items()
+            },
+        )
+        if len(simulation_states) >= num_frames:
+            if sid != simulation_steps - 1:
+                simulator.cam.stop_recording(
+                    save_to_filename=(genesis_dir / "render_rgb.mp4").as_posix(),
+                    fps=20,
+                )
+            break
+
+    if len(simulation_states) != num_frames:
+        raise RuntimeError(
+            f"Expected {num_frames} interaction states, got {len(simulation_states)}"
+        )
+    return simulation_states
+
+
+def precompute_interaction_environment_positions(
+    motion_model,
+    num_frames,
+    scale_factor,
+    viewpoint_camera,
+    motion_mask_path,
+):
+    """Integrate HashGrid displacement for environment points while keeping sky static."""
+    _, env_xyz = gaussians._tmp_get_xyz_all_separate()
+    env_sky_mask = gaussians.is_sky_filter[-env_xyz.shape[0]:]
+    motion_mask = cv2.imread(str(motion_mask_path), cv2.IMREAD_GRAYSCALE)
+    if motion_mask is None:
+        raise FileNotFoundError(f"Environment motion mask not found: {motion_mask_path}")
+
+    uv = proj_uv(env_xyz, viewpoint_camera)
+    camera_rotation = torch.as_tensor(
+        viewpoint_camera.R.T,
+        dtype=env_xyz.dtype,
+        device=env_xyz.device,
+    )
+    camera_translation = torch.as_tensor(
+        viewpoint_camera.T,
+        dtype=env_xyz.dtype,
+        device=env_xyz.device,
+    )
+    camera_xyz = (camera_rotation @ env_xyz.T).T + camera_translation
+    pixel_x = torch.floor(uv[:, 0]).long()
+    pixel_y = torch.floor(uv[:, 1]).long()
+    in_frame = (
+        torch.isfinite(uv).all(dim=1)
+        & (camera_xyz[:, 2] > 1e-6)
+        & (pixel_x >= 0)
+        & (pixel_x < motion_mask.shape[1])
+        & (pixel_y >= 0)
+        & (pixel_y < motion_mask.shape[0])
+    )
+    projected_motion_mask = torch.zeros_like(env_sky_mask, dtype=torch.bool)
+    if in_frame.any():
+        motion_mask_tensor = torch.from_numpy(motion_mask > 0).to(env_xyz.device)
+        projected_motion_mask[in_frame] = motion_mask_tensor[
+            pixel_y[in_frame], pixel_x[in_frame]
+        ]
+
+    environment_mask = (~env_sky_mask) & projected_motion_mask
+    environment_points = env_xyz[environment_mask]
+    if environment_points.shape[0] == 0:
+        raise RuntimeError("Interaction scene contains no moving environment Gaussians")
+    
+    print(
+        f"[interaction-debug] environment_mask count = "
+        f"{int(environment_mask.sum().item())} / {environment_mask.numel()}",
+        flush=True,
+    )
+
+    integration_steps = 100
+    smooth = (
+        1.2
+        / integration_steps
+        * torch.tensor([0.5, 0.5, 2.3], device=env_xyz.device)
+        * scale_factor
+    )
+    forward_positions, _ = pre_euler_integral(
+        environment_points.detach(),
+        motion_model,
+        num_frames,
+        smooth,
+    )
+
+    shift = forward_positions[-1] - forward_positions[0]
+
+    print(
+        f"[interaction-debug] env centroid shift = "
+        f"{(forward_positions[-1].mean(0) - forward_positions[0].mean(0)).detach().cpu().numpy()}",
+        flush=True,
+    )
+    print(
+        f"[interaction-debug] env mean point shift = "
+        f"{shift.norm(dim=1).mean().item()}",
+        flush=True,
+    )
+    print(
+        f"[interaction-debug] env max point shift = "
+        f"{shift.norm(dim=1).max().item()}",
+        flush=True,
+    )
+
+    return env_xyz.detach(), environment_mask, forward_positions
+
+
+def interaction_rendering(
+    simulation_states,
+    motion_model,
+    scene,
+    save_dir,
+    config,
+    video_gen_fps,
+):
+    """Render dynamic object/environment states and generate VACE RAFT flow."""
+    global gaussians, opt, background
+
+    interaction = config.get("interaction", {})
+    scale_factor = float(
+        interaction.get(
+            "environment_scale_factor",
+            config.get("environment_motion", {}).get("scale_factor", 1.0),
+        )
+    )
+    num_frames = len(simulation_states)
+    viewpoint_camera = scene.getTrainCameras().copy()[0]
+    env_xyz, environment_mask, environment_positions = (
+        precompute_interaction_environment_positions(
+            motion_model,
+            num_frames,
+            scale_factor,
+            viewpoint_camera,
+            save_dir / "sam3_mask.png",
+        )
+    )
+
+    traj_dir = save_dir / "traj_00"
+    output_dir = save_dir / "interaction_motion"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name in ["frames", "masks", "depths", "flows", "flows_actual"]:
+        path = traj_dir / name
+        if path.exists():
+            shutil.rmtree(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+    gt_image = viewpoint_camera.original_image.detach().cpu()
+    ToPILImage()(gt_image).save(save_dir / "gt.png")
+    with open((save_dir / "text_prompt.txt").as_posix(), "w") as file:
+        file.write(config.get("text_prompt", " "))
+
+    object_count = gaussians._tmp_get_xyz_all_separate()[0].shape[0]
+    total_count = gaussians.get_xyz_all.shape[0]
+    object_render_mask = torch.zeros(
+        total_count, dtype=torch.bool, device=config["device"]
+    )
+    object_render_mask[:object_count] = True
+
+    frames = []
+    frame_pils = []
+    depth_arrays = []
+    for frame_idx, state in enumerate(
+        tqdm(simulation_states, desc="Unified interaction rendering")
+    ):
+        env_xyz_t = env_xyz.clone()
+        env_xyz_t[environment_mask] = environment_positions[frame_idx]
+        obj_xyz_t = state["obj_0000"]["xyz"]
+
+        render_pkg = render_interaction(
+            viewpoint_camera=viewpoint_camera,
+            pc=gaussians,
+            obj_xyz_t=obj_xyz_t,
+            env_xyz_t=env_xyz_t,
+            opt=opt,
+            bg_color=background,
+            render_visible=False,
+        )
+        object_pkg = render_interaction(
+            viewpoint_camera=viewpoint_camera,
+            pc=gaussians,
+            obj_xyz_t=obj_xyz_t,
+            env_xyz_t=env_xyz_t,
+            opt=opt,
+            bg_color=background,
+            render_visible=False,
+            render_mask=object_render_mask,
+        )
+
+        image = render_pkg["render"].detach().cpu().clamp(0, 1)
+        image_np = (
+            image.permute(1, 2, 0).numpy() * 255
+        ).astype(np.uint8)
+        image_pil = Image.fromarray(image_np)
+        image_pil.save(traj_dir / "frames" / f"frame_{frame_idx:08d}.png")
+        image_pil.save(output_dir / f"frame_{frame_idx:04d}.png")
+        frames.append(image_np)
+        frame_pils.append(image_pil)
+
+        depth = render_pkg["depth"].detach().cpu()
+        depth_arrays.append(depth.numpy())
+        ToPILImage()(depth).save(
+            traj_dir / "depths" / f"depth_{frame_idx:08d}.png"
+        )
+
+        object_mask = (
+            object_pkg["final_opacity"]
+            .detach()
+            .cpu()
+            .permute(1, 2, 0)
+            .numpy()
+        )
+        object_mask = (object_mask > 0.5).astype(np.uint8) * 255
+        cv2.imwrite(
+            (traj_dir / "masks" / f"frame_{frame_idx:08d}.png").as_posix(),
+            object_mask,
+        )
+
+    render_video_path = traj_dir / "render_video.mp4"
+    imageio.mimsave(render_video_path, frames, fps=video_gen_fps)
+    imageio.mimsave(
+        output_dir / "interaction_motion.mp4",
+        frames,
+        fps=video_gen_fps,
+    )
+    frame_pils[0].save(
+        traj_dir / "render_video.gif",
+        save_all=True,
+        append_images=frame_pils[1:],
+        fps=video_gen_fps,
+        loop=0,
+    )
+
+    render_depths = torch.from_numpy(np.concatenate(depth_arrays, axis=0)).float()
+    depth_min = render_depths.min()
+    depth_range = (render_depths.max() - depth_min).clamp_min(1e-12)
+    render_depths = (render_depths - depth_min) ** 2 / depth_range ** 2
+    depth_pils = [ToPILImage()(1 - depth) for depth in render_depths]
+    imageio.mimsave(
+        traj_dir / "render_depths.mp4",
+        depth_pils,
+        fps=video_gen_fps,
+    )
+
+    raft_checkpoint = (
+        _WONDERPLAY_DIR.parent
+        / "VACE"
+        / "models"
+        / "VACE-Annotators"
+        / "flow"
+        / "raft-things.pth"
+    )
+    save_vace_raft_flow(
+        video_path=render_video_path,
+        traj_dir=traj_dir,
+        fps=video_gen_fps,
+        checkpoint_path=raft_checkpoint,
+        device=config["device"],
+    )
+    print(f"[interaction] Unified output saved to {traj_dir}")
+
+
+def run_interaction_pipeline(
+    simulator,
+    scene,
+    save_dir,
+    config,
+    simulation_steps,
+    video_gen_fps,
+):
+    direction, velocity_scale = validate_interaction_config(config)
+    num_frames = int(config.get("interaction", {}).get("num_frames", 50))
+    if num_frames < 2:
+        raise ValueError("interaction.num_frames must be at least 2")
+
+    if direction == "env2obj":
+        motion_model = train_interaction_motion_model(config)
+        query_points = get_interaction_query_points(save_dir)
+        with torch.no_grad():
+            mean_displacement = motion_model(query_points).mean(dim=0)
+        renderer_velocity = velocity_scale * mean_displacement
+        genesis_velocity = renderer_displacement_to_genesis(renderer_velocity)
+        print(
+            "[interaction] Mean environment displacement:",
+            mean_displacement.detach().cpu().numpy(),
+        )
+        print(
+            "[interaction] Scaled renderer velocity:",
+            renderer_velocity.detach().cpu().numpy(),
+        )
+        simulator.force_function = None
+        simulator.set_initial_object_velocity(genesis_velocity)
+        simulation_states = collect_interaction_states(
+            simulator,
+            save_dir,
+            simulation_steps,
+            num_frames,
+        )
+    else:
+        simulation_states = collect_interaction_states(
+            simulator,
+            save_dir,
+            simulation_steps,
+            num_frames,
+        )
+        viewpoint_camera = scene.getTrainCameras().copy()[0]
+        generated_hints = generate_object_motion_hints(
+            simulation_states,
+            viewpoint_camera,
+        )
+        prepare_environment_motion_fields(
+            save_dir,
+            config,
+            fixed_hints_override=generated_hints,
+        )
+        motion_model = train_interaction_motion_model(config)
+
+    interaction_rendering(
+        simulation_states,
+        motion_model,
+        scene,
+        save_dir,
+        config,
+        video_gen_fps,
+    )
 
 
 def environment_motion_rendering(gaussians, scene, save_dir, config, video_gen_fps, sky_gaussians=None):
@@ -708,6 +1225,9 @@ def run(config, dt_string=None):
 
     seeding(config["seed"])
     example = config["example_name"]
+    motion_type = config.get("motion_type", "object")
+    if motion_type == "interaction":
+        validate_interaction_config(config)
 
     segment_processor, segment_model = load_oneformer()
     segment_model = segment_model.to("cuda")
@@ -753,7 +1273,6 @@ def run(config, dt_string=None):
     ).to(config["device"])
 
     # Skip mvdiffusion loading for environment motion mode
-    motion_type = config.get("motion_type", "object")
     if motion_type == "environment":
         print("[INFO] Skipping mvdiffusion loading (not needed for environment motion)")
         mvdiffusion = None
@@ -940,12 +1459,17 @@ def run(config, dt_string=None):
     particle_num_base = 0
     particle_num_object = 0
 
-    motion_type = config.get("motion_type", "object")
     save_dir_sim = None
     if motion_type == "environment":
         save_dir_sim = kf_gen.run_dir / "simulation"
         save_dir_sim.mkdir(parents=True, exist_ok=True)
         prepare_environment_motion_fields(save_dir_sim, config)
+    elif motion_type == "interaction":
+        save_dir_sim = kf_gen.run_dir / "simulation"
+        save_dir_sim.mkdir(parents=True, exist_ok=True)
+        interaction_direction, _ = validate_interaction_config(config)
+        if interaction_direction == "env2obj":
+            prepare_environment_motion_fields(save_dir_sim, config)
 
     ### First scene 3DGS
     if config["gen_layer"]:
@@ -1199,19 +1723,32 @@ def run(config, dt_string=None):
         f.close()
         # train_simulation(sim, scene, save_dir_sim)
 
-        print("=" * 60)
-        print("Object Motion (WonderPlay Genesis)")
-        print("=" * 60)
-        simulation_efficient(
-            sim,
-            scene,
-            save_dir_sim,
-            config,
-            gt_masks,
-            object_pts_num_list,
-            simulation_steps,
-            video_gen_fps,
-        )
+        if motion_type == "interaction":
+            print("=" * 60)
+            print("Environment-Object Interaction")
+            print("=" * 60)
+            run_interaction_pipeline(
+                sim,
+                scene,
+                save_dir_sim,
+                config,
+                simulation_steps,
+                video_gen_fps,
+            )
+        else:
+            print("=" * 60)
+            print("Object Motion (WonderPlay Genesis)")
+            print("=" * 60)
+            simulation_efficient(
+                sim,
+                scene,
+                save_dir_sim,
+                config,
+                gt_masks,
+                object_pts_num_list,
+                simulation_steps,
+                video_gen_fps,
+            )
 
     print("Scene compositional reconstruction and simulation finished.")
 

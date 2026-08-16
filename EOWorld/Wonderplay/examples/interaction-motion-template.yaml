@@ -1,0 +1,114 @@
+# Environment-object interaction scene configuration template.
+# This file is merged with examples/base-config.yaml at runtime.
+# Replace the angle-bracket placeholders before running.
+
+# ========== Scene I/O ==========
+scene_name: "<scene_name>"
+example_name: "<scene_name>"
+input_image: "image.png"
+data_path: "examples/imgs"
+examples_dir: "examples/imgs/<scene_name>"
+sky_image_dir: "examples/imgs/<scene_name>"
+runs_dir: "3d_result/wonderplay/<scene_name>"
+work_dir: "3d_result/wonderplay/<scene_name>"
+
+# ========== Runtime ==========
+seed: 1
+frames: 5
+device: cuda
+debug: True
+
+# ========== Keyframe Generation ==========
+num_scenes: 16
+use_gpt: False
+kf2_upsample_coef: 4
+skip_interp: True
+skip_gen: False
+enable_regenerate: False
+
+# ========== Reconstruction ==========
+finetune_decoder_gen: False
+finetune_decoder_interp: False
+finetune_depth_model: True
+depth_model: marigold
+depth_model_indoor: False
+without_heuristic_set_depth_image: True
+
+inpainting_resolution_gen: 512
+inpainting_resolution_interp: 512
+stable_diffusion_checkpoint: "sd2-community/stable-diffusion-2-inpainting"
+negative_inpainting_prompt: "collage, text, writings, signs, text, white border, photograph border, artifacts, blur, blurry, foggy, fog, bad quality, distortions, distorted image, watermark, signature, fisheye look"
+base_inpainting_prompt: "<background content after object removal>"
+base_inpainting_negative_prompt: "<content to exclude from background>"
+
+rotation_path: [2, 2, 2, 2, 2, 2, 2, 2, -2, -2, -2, -2, -2, -2, -2, -2]
+camera_speed_multiplier_rotation: 0.3
+rotation_range: 0.37
+init_focal_length: 970
+camera_speed: 0.001
+fg_depth_range: 0.015
+depth_shift: 0.001
+sky_hard_depth: 0.02
+gen_sky: False
+gen_layer: True
+refine_depth_conditioning: False
+sky_example_name: "<scene_name>"
+foreground_ids: [<semantic_id>]
+ground_ids: []
+
+# ========== Interaction ==========
+motion_type: "interaction"
+text_prompt: "<object and environment motion description>"
+
+interaction:
+  # Select exactly one propagation direction: env2obj or obj2env.
+  direction: "env2obj"
+
+  # Env2obj alpha in: object velocity = velocity_scale * environment displacement.
+  velocity_scale: <alpha>
+
+  # Number of unified RGB/depth/mask/flow frames. Must be at least 2.
+  num_frames: 50
+
+  # Optional environment integration amplitude. If omitted, the
+  # environment_motion.scale_factor value is used.
+  environment_scale_factor: <environment_motion_strength>
+
+# ========== Object Reconstruction ==========
+imgto3D: True
+imgto3d_method: "instantmesh"
+imgto3d_fg_ratio: 0.85
+imgto3d_resolution: 128
+imgto3d_optimization_iters: 3500
+
+# Interaction V1 supports exactly one object.
+object_num: 1
+object_split_mask_sam_ids: [<sam_mask_id>]
+
+# ========== Genesis Physics ==========
+# env2obj requires rigid. obj2env may reuse any material already supported by
+# the existing Simulator, provided its configured force produces visible motion.
+material_types: ["rigid"]
+force_function_name: "<existing_force_function_name>"
+
+rigid_friction: 0.05
+rigid_coup_friction: 0.05
+rigid_coup_softness: 0.1
+collision_force_with_env: False
+collision_force_with_obj: False
+collision_constraint_with_env: True
+collision_constraint_with_obj: True
+simulation_iterations: 2
+simulation_steps: 50
+dt: 0.01
+boundary_rules: {y_min: -0.4}
+
+# ========== Environment Motion ==========
+environment_motion:
+  scale_factor: <environment_motion_strength>
+  sam_prompt: "<moving_environment_region>"
+
+  # env2obj uses these manual hints. obj2env ignores this list and generates one
+  # hint from the first two adjacent visible Genesis object states.
+  fixed_hints:
+    - [<start_x>, <start_y>, <end_x>, <end_y>]

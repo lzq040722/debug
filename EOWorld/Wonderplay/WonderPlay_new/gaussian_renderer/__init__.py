@@ -802,6 +802,41 @@ def render_dynamic(
             "median_depth": median_depth,}
 
 
+def render_interaction(
+    viewpoint_camera,
+    pc: GaussianModel,
+    obj_xyz_t,
+    env_xyz_t,
+    opt,
+    bg_color: torch.Tensor,
+    render_visible=False,
+    render_mask=None,
+):
+    """Render dynamic object and environment Gaussians with static attributes."""
+    obj_xyz, env_xyz = pc._tmp_get_xyz_all_separate()
+    if obj_xyz_t.shape != obj_xyz.shape:
+        raise ValueError(
+            f"Interaction object shape mismatch: {obj_xyz_t.shape} vs {obj_xyz.shape}"
+        )
+    if env_xyz_t.shape != env_xyz.shape:
+        raise ValueError(
+            f"Interaction environment shape mismatch: {env_xyz_t.shape} vs {env_xyz.shape}"
+        )
+    if not torch.isfinite(obj_xyz_t).all() or not torch.isfinite(env_xyz_t).all():
+        raise ValueError("Interaction positions contain NaN or Inf")
+
+    dynamic_xyz = torch.cat([obj_xyz_t, env_xyz_t], dim=0)
+    return render_dynamic(
+        viewpoint_camera=viewpoint_camera,
+        pc=pc,
+        opt=opt,
+        bg_color=bg_color,
+        render_visible=render_visible,
+        render_mask=render_mask,
+        dynamic_xyz=dynamic_xyz,
+    )
+
+
 def render(viewpoint_camera, pc: GaussianModel, opt, bg_color: torch.Tensor, scaling_modifier=1.0, override_color=None, render_visible=False, exclude_sky=False,
            timestep=None, movement_sim=None, render_mask=None):
     """
@@ -953,5 +988,4 @@ def render(viewpoint_camera, pc: GaussianModel, opt, bg_color: torch.Tensor, sca
             "final_opacity": final_opacity,
             "depth": depth,
             "median_depth": median_depth,}
-
 

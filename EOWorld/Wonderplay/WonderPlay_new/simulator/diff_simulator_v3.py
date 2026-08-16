@@ -1008,6 +1008,37 @@ class Simulator(nn.Module):
             for obj_id, points in self.pbd_cloth_fix.items():
                 for point in points:
                     self.objs[obj_id].fix_particle(self.objs[obj_id].find_closest_particle(point))
+
+    def set_initial_object_velocity(self, velocity, obj_id=0):
+        """Set one rigid object's linear velocity without adding angular velocity."""
+        if self.len_obj != 1:
+            raise ValueError("Interaction V1 supports exactly one object")
+        if obj_id != 0:
+            raise ValueError("Interaction V1 only supports obj_id=0")
+        if self.material_types[obj_id] != "rigid":
+            raise NotImplementedError(
+                "Interaction V1 initial velocity currently supports rigid objects only"
+            )
+
+        velocity = torch.as_tensor(
+            velocity, dtype=torch.float32, device=self.device
+        ).reshape(-1)
+        if velocity.numel() != 3 or not torch.isfinite(velocity).all():
+            raise ValueError("Initial object velocity must contain three finite values")
+
+        qvel = torch.zeros(
+            self.objs[obj_id].n_dofs, dtype=torch.float32, device=self.device
+        )
+        if qvel.numel() != 6:
+            raise RuntimeError(
+                f"Expected a free rigid object with 6 DoFs, got {qvel.numel()}"
+            )
+        qvel[:3] = velocity
+        self.objs[obj_id].set_dofs_velocity(qvel)
+        print(
+            "[interaction] Set Genesis initial linear velocity:",
+            velocity.detach().cpu().numpy(),
+        )
         
     def env_process(self, env_xyz, obj_valid_min, obj_valid_max, obj_min, obj_max):
         # by option keep only the environment within the object range
