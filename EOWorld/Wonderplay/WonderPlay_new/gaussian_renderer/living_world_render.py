@@ -306,3 +306,301 @@ def render_MLP(viewpoint_camera, pc, motion_model, t, opt, bg_color: torch.Tenso
             "visibility_filter" : radii > 0,
             "radii": radii,
             "depth": depth,}
+
+
+def render_interaction_mlp(
+    viewpoint_camera,
+    pc,
+    motion_model,
+    obj_xyz_t,
+    t,
+    opt,
+    bg_color: torch.Tensor,
+    scaling_modifier=1.0,
+    override_color=None,
+    render_visible=False,
+    exclude_sky=False,
+    render_mask=None,
+    scale_factor=2.0,
+):
+    """Render Genesis object states with the baseline LivingWorld env motion."""
+
+    if not hasattr(render_interaction_mlp, "_cache"):
+        render_interaction_mlp._cache = {
+            "key": None,
+            "f_pos": None,
+            "b_pos": None,
+        }
+
+    obj_xyz, _ = pc._tmp_get_xyz_all_separate()
+    if obj_xyz_t.shape != obj_xyz.shape:
+        raise ValueError(
+            f"Interaction object shape mismatch: {obj_xyz_t.shape} vs {obj_xyz.shape}"
+        )
+    if not torch.isfinite(obj_xyz_t).all():
+        raise ValueError("Interaction object positions contain NaN or Inf")
+
+    obj_count = obj_xyz.shape[0]
+    total_count = pc.get_xyz_all.shape[0]
+    env_count = total_count - obj_count
+
+    def align_bool_mask(mask, name, obj_default):
+        """Align env-only masks to the interaction object+environment layout."""
+        if mask is None:
+            return None
+        if mask.dim() > 1:
+            if mask.shape[-1] == 1:
+                mask = mask[:, 0]
+            else:
+                raise ValueError(
+                    f"{name} should be 1D or Nx1, got shape {tuple(mask.shape)}"
+                )
+        mask = mask.bool()
+        if mask.shape[0] == total_count:
+            return mask
+        if mask.shape[0] == env_count:
+            obj_mask = torch.full(
+                (obj_count,),
+                bool(obj_default),
+                dtype=torch.bool,
+                device=mask.device,
+            )
+            return torch.cat([obj_mask, mask], dim=0)
+        raise ValueError(
+            f"{name} length {mask.shape[0]} does not match total={total_count} "
+            f"or env={env_count}"
+        )
+
+    screenspace_points = (
+        torch.zeros_like(
+            pc.get_xyz_all,
+            dtype=pc.get_xyz_all.dtype,
+            requires_grad=True,
+            device="cuda",
+        )
+        + 0
+    )
+    try:
+        screenspace_points.retain_grad()
+    except:
+        pass
+
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=opt.debug,
+    )
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    means3D = pc.get_xyz_all.clone()
+    means3D[:obj_count] = obj_xyz_t.to(device=means3D.device, dtype=means3D.dtype)
+    means2D = screenspace_points
+    opacity = pc.get_opacity_all
+    motion_mask = align_bool_mask(
+        pc.get_motion_mask_all.detach(),
+        "motion_mask_all",
+        obj_default=False,
+    )
+
+    scales = None
+    rotations = None
+    cov3D_precomp = None
+    if opt.compute_cov3D_python:
+        cov3D_precomp = pc.get_covariance_all(scaling_modifier)
+    else:
+        scales = pc.get_scaling_all
+        rotations = pc.get_rotation_all
+
+    shs = None
+    colors_precomp = None
+    if override_color is None:
+        if opt.convert_SHs_python:
+            shs_view = pc.get_features_all.transpose(1, 2).view(-1, 3)
+            colors_precomp = pc.color_activation(shs_view)
+        else:
+            shs = pc.get_features_all
+    else:
+        colors_precomp = override_color
+
+    delete_mask_all = align_bool_mask(
+        pc.delete_mask_all.detach(),
+        "delete_mask_all",
+        obj_default=False,
+    )
+    if render_visible:
+        visibility_filter_all = align_bool_mask(
+            pc.visibility_filter_all.detach(),
+            "visibility_filter_all",
+            obj_default=True,
+        )
+        visibility_filter_all = visibility_filter_all & ~delete_mask_all
+    else:
+        visibility_filter_all = ~delete_mask_all
+
+    if exclude_sky:
+        is_sky_filter = align_bool_mask(
+            pc.is_sky_filter.detach(),
+            "is_sky_filter",
+            obj_default=False,
+        )
+        visibility_filter_all = visibility_filter_all & ~is_sky_filter
+
+    if render_mask is not None:
+        render_mask = align_bool_mask(
+            render_mask.detach(),
+            "render_mask",
+            obj_default=True,
+        )
+        visibility_filter_all = visibility_filter_all & render_mask
+
+    object_filter = torch.zeros_like(visibility_filter_all, dtype=torch.bool)
+    object_filter[:obj_count] = True
+
+    means3D = means3D[visibility_filter_all]
+    means2D = means2D[visibility_filter_all]
+    opacity = opacity[visibility_filter_all]
+    scales = scales[visibility_filter_all]
+    rotations = rotations[visibility_filter_all]
+    cov3D_precomp = None if cov3D_precomp is None else cov3D_precomp[visibility_filter_all]
+    shs = None if shs is None else shs[visibility_filter_all]
+    colors_precomp = (
+        None if colors_precomp is None else colors_precomp[visibility_filter_all]
+    )
+
+    object_visible = object_filter[visibility_filter_all]
+    motion_mask = motion_mask[visibility_filter_all].bool()
+    motion_mask = motion_mask & ~object_visible
+
+    if motion_model is not None:
+        T = 100
+        motion_pts = means3D[motion_mask]
+
+        if motion_pts.shape[0] == 0:
+            print(
+                "[render_interaction_mlp] WARNING: no environment motion points; "
+                "rendering static environment"
+            )
+        else:
+            smooth = (
+                1.2
+                / T
+                * torch.tensor([0.5, 0.5, 2.3], device=means3D.device)
+                * scale_factor
+            )
+            cache_key = (
+                id(motion_model),
+                T,
+                float(scale_factor),
+                int(motion_pts.shape[0]),
+                float(smooth[0].item()),
+                float(smooth[1].item()),
+                float(smooth[2].item()),
+                float(motion_pts[:, 0].mean().item()),
+                float(motion_pts[:, 1].mean().item()),
+                float(motion_pts[:, 2].mean().item()),
+                float(motion_pts[:, 0].std().item()),
+                float(motion_pts[:, 1].std().item()),
+                float(motion_pts[:, 2].std().item()),
+            )
+
+            c = render_interaction_mlp._cache
+            if c["key"] != cache_key:
+                torch.cuda.synchronize()
+                t0 = time.time()
+                f_pos, b_pos = pre_euler_integral(
+                    motion_pts.detach(),
+                    motion_model,
+                    T + 1,
+                    smooth,
+                )
+                torch.cuda.synchronize()
+                t1 = time.time()
+                print(
+                    f"[timing] interaction pre_euler_integral "
+                    f"{(t1 - t0) * 1000:.2f} ms"
+                )
+                c["key"] = cache_key
+                c["f_pos"] = f_pos
+                c["b_pos"] = b_pos
+            else:
+                f_pos, b_pos = c["f_pos"], c["b_pos"]
+
+            t = int(t)
+            if t < 0 or t > T:
+                raise ValueError(f"render_interaction_mlp timestep {t} outside [0, {T}]")
+            b_idx = T - t
+            alpha = t / T
+            w_f = 1 - alpha
+            w_b = alpha
+
+            means3D_f = means3D.clone()
+            means3D_b = means3D.clone()
+            moving_idx = motion_mask.nonzero(as_tuple=False).squeeze()
+            means3D_f[moving_idx] = f_pos[t]
+            means3D_b[moving_idx] = b_pos[b_idx]
+
+            opacity_base = opacity
+            opacity = torch.cat([opacity_base * w_f, opacity_base * w_b], dim=0)
+            means3D = torch.cat([means3D_f, means3D_b], dim=0)
+            means2D = torch.cat([means2D, means2D], dim=0)
+            scales = torch.cat([scales, scales], dim=0)
+            rotations = torch.cat([rotations, rotations], dim=0)
+            shs = None if shs is None else torch.cat([shs, shs], dim=0)
+            colors_precomp = (
+                None
+                if colors_precomp is None
+                else torch.cat([colors_precomp, colors_precomp], dim=0)
+            )
+            cov3D_precomp = (
+                None
+                if cov3D_precomp is None
+                else torch.cat([cov3D_precomp, cov3D_precomp], dim=0)
+            )
+
+    _check(
+        ("means3D", means3D),
+        ("means2D", means2D),
+        ("opacity", opacity),
+        ("scales", scales),
+        ("rot", rotations),
+        ("cov", cov3D_precomp),
+        ("shs", shs),
+        ("colors", colors_precomp),
+    )
+
+    N = means3D.shape[0]
+    dummy_feats3D = torch.zeros((N, 20), device=means3D.device, dtype=means3D.dtype)
+    dummy_delta = torch.zeros((N, 3), device=means3D.device, dtype=means3D.dtype)
+
+    rendered_image, radii, feats, depth, flow = rasterizer(
+        means3D=means3D,
+        means2D=means2D,
+        shs=shs,
+        colors_precomp=colors_precomp,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=cov3D_precomp,
+        feats3D=dummy_feats3D,
+        delta=dummy_delta,
+    )
+
+    return {
+        "render": rendered_image,
+        "viewspace_points": screenspace_points,
+        "visibility_filter": radii > 0,
+        "radii": radii,
+        "depth": depth,
+    }

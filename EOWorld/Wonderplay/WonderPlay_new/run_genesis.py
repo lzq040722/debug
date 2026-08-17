@@ -81,7 +81,11 @@ from gaussian_renderer import (
     render_w_shift_flow,
     render_w_shift_da,
 )
-from gaussian_renderer.living_world_render import render_MLP, pre_euler_integral
+from gaussian_renderer.living_world_render import (
+    render_MLP,
+    render_interaction_mlp,
+    pre_euler_integral,
+)
 from hashgrid import HashEncoderMotionModel
 from scene import Scene, GaussianModel
 from scene.cameras import Camera
@@ -447,15 +451,58 @@ def validate_interaction_config(config):
 
 def train_interaction_motion_model(config):
     """Train on the inpainted environment points in Gaussian world units."""
-    current_pc = kf_gen.get_current_pc_latest()
-    xyz = current_pc["xyz"]
-    scene_flow = current_pc["scene_flow"]
+    direction = str(config.get("interaction", {}).get("direction", "")).lower()
+    scale = float(config.get("interaction", {}).get("xyz_scale", xyz_scale))
+    source = "current_pc_scaled"
+
+    if direction == "env2obj" and gaussians is not None:
+        try:
+            _, env_xyz = gaussians._tmp_get_xyz_all_separate()
+            scene_flow_all = gaussians.get_scene_flow_all.detach()
+            env_count = env_xyz.shape[0]
+            total_count = gaussians.get_xyz_all.shape[0]
+            if scene_flow_all.shape[0] == total_count:
+                env_scene_flow = scene_flow_all[-env_count:]
+            elif scene_flow_all.shape[0] == env_count:
+                env_scene_flow = scene_flow_all
+            else:
+                raise RuntimeError(
+                    f"scene_flow length {scene_flow_all.shape[0]} does not match "
+                    f"total={total_count} or env={env_count}"
+                )
+            xyz = env_xyz.detach()
+            scene_flow = env_scene_flow
+            source = "gaussians_env"
+        except Exception as exc:
+            print(
+                "[interaction] WARNING: failed to train HashGrid from Gaussian "
+                f"environment points ({exc}); falling back to scaled current_pc"
+            )
+            current_pc = kf_gen.get_current_pc_latest()
+            xyz = current_pc["xyz"] * scale
+            scene_flow = current_pc.get(
+                "scene_flow",
+                torch.zeros_like(current_pc["xyz"]),
+            ) * scale
+    else:
+        current_pc = kf_gen.get_current_pc_latest()
+        xyz = current_pc["xyz"] * scale
+        scene_flow = current_pc.get(
+            "scene_flow",
+            torch.zeros_like(current_pc["xyz"]),
+        ) * scale
+
+    print(
+        f"[interaction] Training HashGrid source={source}, xyz_scale={scale:g}: "
+        f"xyz_abs_mean={xyz.detach().abs().mean().item():.6f}, "
+        f"flow_abs_mean={scene_flow.detach().abs().mean().item():.6f}"
+    )
     motion_pc = _InteractionMotionPointCloud(xyz, scene_flow)
     motion_model = HashEncoderMotionModel().to(config["device"])
     return train_hashgrid(motion_pc, motion_model, iterations=100)
 
 
-def get_interaction_query_points(save_dir):
+def get_interaction_query_points(save_dir, config=None):
     """Select inpainted environment points under the single object silhouette."""
     object_mask_path = kf_gen.run_dir / "segmentation" / "object_00.png"
     if not object_mask_path.exists():
@@ -492,7 +539,10 @@ def get_interaction_query_points(save_dir):
             "Environment point/mask count mismatch: "
             f"{environment_xyz.shape[0]} vs {query_in_environment.shape[0]}"
         )
-    query_points = environment_xyz[query_in_environment]
+    scale = float(
+        (config or {}).get("interaction", {}).get("xyz_scale", xyz_scale)
+    )
+    query_points = environment_xyz[query_in_environment] * scale
     if query_points.shape[0] == 0:
         raise RuntimeError("Object mask contains no valid inpainted environment points")
 
@@ -500,7 +550,8 @@ def get_interaction_query_points(save_dir):
         (interaction_mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
     ).save(save_dir / "interaction_query_mask.png")
     print(
-        f"[interaction] HashGrid query region: {query_points.shape[0]} environment points"
+        f"[interaction] HashGrid query region: {query_points.shape[0]} "
+        f"environment points in 3DGS units with xyz_scale={scale:g}"
     )
     return query_points
 
@@ -724,15 +775,6 @@ def interaction_rendering(
     )
     num_frames = len(simulation_states)
     viewpoint_camera = scene.getTrainCameras().copy()[0]
-    env_xyz, environment_mask, environment_positions = (
-        precompute_interaction_environment_positions(
-            motion_model,
-            num_frames,
-            scale_factor,
-            viewpoint_camera,
-            save_dir / "sam3_mask.png",
-        )
-    )
 
     traj_dir = save_dir / "traj_00"
     output_dir = save_dir / "interaction_motion"
@@ -748,7 +790,8 @@ def interaction_rendering(
     with open((save_dir / "text_prompt.txt").as_posix(), "w") as file:
         file.write(config.get("text_prompt", " "))
 
-    object_count = gaussians._tmp_get_xyz_all_separate()[0].shape[0]
+    obj_xyz_static, env_xyz_static = gaussians._tmp_get_xyz_all_separate()
+    object_count = obj_xyz_static.shape[0]
     total_count = gaussians.get_xyz_all.shape[0]
     object_render_mask = torch.zeros(
         total_count, dtype=torch.bool, device=config["device"]
@@ -761,24 +804,24 @@ def interaction_rendering(
     for frame_idx, state in enumerate(
         tqdm(simulation_states, desc="Unified interaction rendering")
     ):
-        env_xyz_t = env_xyz.clone()
-        env_xyz_t[environment_mask] = environment_positions[frame_idx]
         obj_xyz_t = state["obj_0000"]["xyz"]
 
-        render_pkg = render_interaction(
+        render_pkg = render_interaction_mlp(
             viewpoint_camera=viewpoint_camera,
             pc=gaussians,
+            motion_model=motion_model,
             obj_xyz_t=obj_xyz_t,
-            env_xyz_t=env_xyz_t,
+            t=frame_idx,
             opt=opt,
             bg_color=background,
             render_visible=False,
+            scale_factor=scale_factor,
         )
         object_pkg = render_interaction(
             viewpoint_camera=viewpoint_camera,
             pc=gaussians,
             obj_xyz_t=obj_xyz_t,
-            env_xyz_t=env_xyz_t,
+            env_xyz_t=env_xyz_static,
             opt=opt,
             bg_color=background,
             render_visible=False,
@@ -873,7 +916,7 @@ def run_interaction_pipeline(
 
     if direction == "env2obj":
         motion_model = train_interaction_motion_model(config)
-        query_points = get_interaction_query_points(save_dir)
+        query_points = get_interaction_query_points(save_dir, config)
         with torch.no_grad():
             mean_displacement = motion_model(query_points).mean(dim=0)
         renderer_velocity = velocity_scale * mean_displacement
