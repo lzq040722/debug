@@ -1009,22 +1009,22 @@ class Simulator(nn.Module):
                 for point in points:
                     self.objs[obj_id].fix_particle(self.objs[obj_id].find_closest_particle(point))
 
-    def set_initial_object_velocity(self, velocity, obj_id=0):
-        """Set one rigid object's linear velocity without adding angular velocity."""
+    def set_object_linear_velocity(self, velocity, obj_id=0):
+        """Set one rigid object's linear velocity without angular velocity."""
         if self.len_obj != 1:
             raise ValueError("Interaction V1 supports exactly one object")
         if obj_id != 0:
             raise ValueError("Interaction V1 only supports obj_id=0")
         if self.material_types[obj_id] != "rigid":
             raise NotImplementedError(
-                "Interaction V1 initial velocity currently supports rigid objects only"
+                "Interaction V1 velocity transfer currently supports rigid objects only"
             )
 
         velocity = torch.as_tensor(
             velocity, dtype=torch.float32, device=self.device
         ).reshape(-1)
         if velocity.numel() != 3 or not torch.isfinite(velocity).all():
-            raise ValueError("Initial object velocity must contain three finite values")
+            raise ValueError("Object linear velocity must contain three finite values")
 
         qvel = torch.zeros(
             self.objs[obj_id].n_dofs, dtype=torch.float32, device=self.device
@@ -1036,7 +1036,7 @@ class Simulator(nn.Module):
         qvel[:3] = velocity
         self.objs[obj_id].set_dofs_velocity(qvel)
         print(
-            "[interaction] Set Genesis initial linear velocity:",
+            "[interaction] Set Genesis object linear velocity:",
             velocity.detach().cpu().numpy(),
         )
         

@@ -621,6 +621,7 @@ def collect_interaction_states(
     simulation_steps,
     num_frames,
     gaussian_vis_freq=20,
+    persistent_velocity=None,
 ):
     """Run Genesis once and retain the visible object states for unified rendering."""
     genesis_dir = save_dir / "genesis"
@@ -630,6 +631,9 @@ def collect_interaction_states(
 
     simulation_states = []
     for sid in tqdm(range(simulation_steps), desc="Interaction Genesis simulation"):
+        if persistent_velocity is not None:
+            simulator.set_object_linear_velocity(persistent_velocity)
+
         sim_out = simulator.simulate_step(
             sid,
             simulation_steps,
@@ -921,6 +925,10 @@ def run_interaction_pipeline(
             mean_displacement = motion_model(query_points).mean(dim=0)
         renderer_velocity = velocity_scale * mean_displacement
         genesis_velocity = renderer_displacement_to_genesis(renderer_velocity)
+
+        # Water drives boat horizontally only.
+        genesis_velocity[2] = 0.0
+
         print(
             "[interaction] Mean environment displacement:",
             mean_displacement.detach().cpu().numpy(),
@@ -930,12 +938,12 @@ def run_interaction_pipeline(
             renderer_velocity.detach().cpu().numpy(),
         )
         simulator.force_function = None
-        simulator.set_initial_object_velocity(genesis_velocity)
         simulation_states = collect_interaction_states(
             simulator,
             save_dir,
             simulation_steps,
             num_frames,
+            persistent_velocity=genesis_velocity,
         )
     else:
         simulation_states = collect_interaction_states(

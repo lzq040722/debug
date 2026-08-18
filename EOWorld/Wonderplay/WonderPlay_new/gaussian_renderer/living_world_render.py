@@ -187,7 +187,7 @@ def render_MLP(viewpoint_camera, pc, motion_model, t, opt, bg_color: torch.Tenso
         else:
             ax_len = torch.max(motion_pts, dim=0)[0] - torch.min(motion_pts, dim=0)[0]
 
-            smooth = (1.2 / T * torch.tensor([0.5,0.5,2.3], device=means3D.device)) * scale_factor
+            smooth = (1.2 / T * torch.tensor([0.5,0.5,1.3], device=means3D.device)) * scale_factor
 
             torch.cuda.synchronize()
             t0 = time.time()
@@ -207,6 +207,8 @@ def render_MLP(viewpoint_camera, pc, motion_model, t, opt, bg_color: torch.Tenso
                 t0 = time.time()
 
                 f_pos, b_pos = pre_euler_integral(motion_pts.detach(), motion_model, T+1, smooth)
+
+
 
                 torch.cuda.synchronize()
                 t1 = time.time()
@@ -496,7 +498,7 @@ def render_interaction_mlp(
             smooth = (
                 1.2
                 / T
-                * torch.tensor([0.5, 0.5, 2.3], device=means3D.device)
+                * torch.tensor([0.5, 0.5, 0.5], device=means3D.device)
                 * scale_factor
             )
             cache_key = (
@@ -525,6 +527,11 @@ def render_interaction_mlp(
                     T + 1,
                     smooth,
                 )
+
+                # # Keep the water surface at its original height.
+                # f_pos[..., 1] = motion_pts[None, :, 1]
+                # b_pos[..., 1] = motion_pts[None, :, 1]
+                
                 torch.cuda.synchronize()
                 t1 = time.time()
                 print(

@@ -46,26 +46,26 @@ b. 把VACE 官方得到光流信息的流程加入到现有的方法当中。（
 
 python vace/vace_preproccess.py \
   --task flow \
-  --video /root/autodl-tmp/EOWorld/Wonderplay/3d_result/wonderplay/venice/Gen-14-08_20-43-06/simulation/traj_00/render_video.mp4 \
-  --pre_save_dir /root/autodl-tmp/EOWorld/Wonderplay/3d_result/wonderplay/venice/Gen-14-08_20-43-06/simulation/vace_flow
+  --video /root/autodl-tmp/EOWorld/Wonderplay/3d_result/wonderplay/venice/Gen-18-08_10-44-28/simulation/traj_00/render_video.mp4 \
+  --pre_save_dir /root/autodl-tmp/EOWorld/Wonderplay/3d_result/wonderplay/venice/Gen-18-08_10-44-28/simulation/vace_flow
 
-python Wan2.1.backup_20260810_215736/generate.py \
+python Wan2.1/generate.py \
   --task vace-14B \
   --size  832*480 \
   --ckpt_dir /root/autodl-tmp/huggingface/Wan2.1-VACE-14B \
-  --prompt "river water flowing steadily downstream" \
-  --src_video /root/autodl-tmp/EOWorld/Wonderplay/3d_result/wonderplay/alpine/Gen-11-08_23-26-15/simulation/vace_flow/src_video-flow.mp4 \
-  --src_ref_images 3d_result/wonderplay/alpine/Gen-11-08_23-26-15/simulation/gt.png \
+  --prompt "A boat on the river" \
+  --src_video /root/autodl-tmp/EOWorld/Wonderplay/3d_result/wonderplay/venice/Gen-18-08_10-44-28/simulation/vace_flow/src_video-flow.mp4 \
+  --src_ref_images 3d_result/wonderplay/venice/Gen-18-08_10-44-28/simulation/gt.png \
   --frame_num 49 \
-  --save_file 3d_result/wonderplay/alpine/Gen-11-08_23-26-15/test_flow_vace_wan2.1.mp4 \
-  --init_video3d_result/wonderplay/alpine/Gen-11-08_23-26-15/simulation/traj_00/render_video.mp4 \
+  --save_file 3d_result/wonderplay/venice/Gen-18-08_10-44-28/test_flow_vace_wan2.1.mp4 \
+  --init_video 3d_result/wonderplay/venice/Gen-18-08_10-44-28/simulation/traj_00/render_video.mp4 \
   --sdedit_strength 0.5 \
 
 
 ffmpeg -y \
   -framerate 8 \
   -pattern_type glob \
-  -i '3d_result/wonderplay/venice/Gen-14-08_20-43-06/simulation/traj_00/frames/frame_*.png' \
+  -i '3d_result/wonderplay/venice/Gen-18-08_10-44-28/simulation/traj_00/frames/frame_*.png' \
   -vf "scale=832:480:force_original_aspect_ratio=decrease,pad=832:480:(ow-iw)/2:(oh-ih)/2" \
   -c:v libx264 \
   -preset slow \
@@ -86,9 +86,9 @@ PY
 
 转换成realwonder 所需要格式：
 CUDA_VISIBLE_DEVICES=0 python prepare_realwonder_input.py \
-  --simulation_dir 3d_result/wonderplay/venice/Gen-14-08_20-43-06/simulation \
+  --simulation_dir 3d_result/wonderplay/venice/horizontal_motion/simulation \
   --traj_id 0 \
-  --output_dir /root/autodl-tmp/RealWonder/input_data/venice/final_sim \
+  --output_dir /root/autodl-tmp/RealWonder/input_data/venice_I_horizontal_motion/final_sim \
   --num_output_frames 12 \
   --flow_format normalized \
   --overwrite
@@ -96,8 +96,8 @@ CUDA_VISIBLE_DEVICES=0 python prepare_realwonder_input.py \
 跑realwonder 视频生成模型：
 CUDA_VISIBLE_DEVICES=0 python infer_sim.py \
   --checkpoint_path 'ckpts/Realwonder-Distilled-AR-I2V-Flow/sink_size=1-attn_size=21-frame_per_block=3-denoising_steps=4/step=000800.pt' \
-  --sim_data_path input_data/venice/final_sim \
-  --output_path input_data/venice/final_sim/realwonder_output2.mp4 \
+  --sim_data_path input_data/venice_I_horizontal_motion/final_sim \
+  --output_path input_data/venice_I_horizontal_motion/final_sim/realwonder_output.mp4 \
   --eval_degradation 0.5 \
   --local_attn_size 21 \
   --seed 42
@@ -113,3 +113,31 @@ final_hint_end_y-3d [array([473.], dtype=float32), array([449.], dtype=float32),
 git add.
 git commit -m ' ' 
 git push
+
+11. stresss test:
+/root/autodl-tmp/LivingWorld/scripts/gpu_stress_every_30min.sh
+
+12. run_genesis.py (929行)
+renderer_velocity = velocity_scale * mean_displacement
+
+genesis_velocity = renderer_displacement_to_genesis(
+    renderer_velocity
+)
+
+# Water drives boat horizontally only.
+genesis_velocity[2] = 0.0
+
+living_world_render.py(534)
+
+f_pos, b_pos = pre_euler_integral(
+    motion_pts.detach(),
+    motion_model,
+    T + 1,
+    smooth,
+)
+
+# Keep the water surface at its original height.
+f_pos[..., 1] = motion_pts[None, :, 1]
+b_pos[..., 1] = motion_pts[None, :, 1]
+
+501行修改 smooth 参数 2.3-->0.5

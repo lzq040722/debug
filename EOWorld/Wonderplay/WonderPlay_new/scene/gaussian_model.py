@@ -371,20 +371,45 @@ class GaussianModel:
     @property
     def get_scene_flow_all(self):
         """Scene flow for environment motion (LivingWorld)"""
-        if hasattr(self, '_scene_flow_all'):
+        if hasattr(self, '_scene_flow_all') and self._scene_flow_all.shape[0] == self.get_xyz_all.shape[0]:
             return self._scene_flow_all
         if not hasattr(self, '_scene_flow'):
             return torch.zeros_like(self.get_xyz_all)
-        return torch.cat([self._scene_flow, self._scene_flow_prev], dim=0)
+        scene_flow = self._scene_flow
+        if scene_flow.shape[0] != self._xyz.shape[0]:
+            scene_flow = torch.zeros_like(self._xyz.detach())
+        scene_flow_prev = self._scene_flow_prev
+        if scene_flow_prev.shape[0] != self._xyz_prev.shape[0]:
+            scene_flow_prev = torch.zeros_like(self._xyz_prev.detach())
+        return torch.cat([scene_flow, scene_flow_prev], dim=0)
 
     @property
     def get_motion_mask_all(self):
         """Motion mask for environment motion (LivingWorld)"""
-        if hasattr(self, '_motion_mask_all'):
+        if hasattr(self, '_motion_mask_all') and self._motion_mask_all.shape[0] == self.get_xyz_all.shape[0]:
             return self._motion_mask_all
         if not hasattr(self, '_motion_mask'):
             return torch.zeros(self.get_xyz_all.shape[0], 1, dtype=torch.bool, device='cuda')
-        return torch.cat([self._motion_mask, self._motion_mask_prev], dim=0)
+        motion_mask = self._motion_mask
+        if motion_mask.shape[0] != self._xyz.shape[0]:
+            motion_mask = torch.zeros(
+                self._xyz.shape[0], 1, dtype=torch.bool, device=self._xyz.device
+            )
+        elif motion_mask.ndim == 1:
+            motion_mask = motion_mask[:, None]
+        else:
+            motion_mask = motion_mask[:, :1]
+
+        motion_mask_prev = self._motion_mask_prev
+        if motion_mask_prev.shape[0] != self._xyz_prev.shape[0]:
+            motion_mask_prev = torch.zeros(
+                self._xyz_prev.shape[0], 1, dtype=torch.bool, device=self._xyz_prev.device
+            )
+        elif motion_mask_prev.ndim == 1:
+            motion_mask_prev = motion_mask_prev[:, None]
+        else:
+            motion_mask_prev = motion_mask_prev[:, :1]
+        return torch.cat([motion_mask.bool(), motion_mask_prev.bool()], dim=0)
 
     # ========== End LivingWorld Properties ==========
 
@@ -629,12 +654,30 @@ class GaussianModel:
         input_scaling = gaussians._scaling
         input_rotation = gaussians._rotation
         input_opacity = gaussians._opacity
+        input_scene_flow = getattr(gaussians, "_scene_flow", None)
+        if input_scene_flow is None or input_scene_flow.shape[0] != input_xyz.shape[0]:
+            input_scene_flow = torch.zeros_like(input_xyz.detach())
+        else:
+            input_scene_flow = input_scene_flow.detach()
+        input_motion_mask = getattr(gaussians, "_motion_mask", None)
+        if input_motion_mask is None or input_motion_mask.shape[0] != input_xyz.shape[0]:
+            input_motion_mask = torch.zeros(
+                input_xyz.shape[0], 1, dtype=torch.bool, device=input_xyz.device
+            )
+        else:
+            input_motion_mask = input_motion_mask.detach().bool()
+            if input_motion_mask.ndim == 1:
+                input_motion_mask = input_motion_mask[:, None]
+            else:
+                input_motion_mask = input_motion_mask[:, :1]
 
         if self._xyz.numel() == 0:
             print(
                 "Initializing ", input_xyz.shape[0], " points from existing gaussians"
             )
             self._xyz = nn.Parameter(input_xyz.requires_grad_(True))
+            self._scene_flow = input_scene_flow
+            self._motion_mask = input_motion_mask
             self._features_dc = nn.Parameter(
                 input_features_dc.contiguous().requires_grad_(True)
             )
@@ -650,6 +693,8 @@ class GaussianModel:
             self._xyz = nn.Parameter(
                 torch.cat((self._xyz, input_xyz), dim=0).requires_grad_(True)
             )
+            self._scene_flow = torch.cat((self._scene_flow, input_scene_flow), dim=0)
+            self._motion_mask = torch.cat((self._motion_mask, input_motion_mask), dim=0)
             self._features_dc = nn.Parameter(
                 torch.cat(
                     (self._features_dc, input_features_dc.contiguous()), dim=0
