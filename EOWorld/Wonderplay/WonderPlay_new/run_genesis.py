@@ -430,6 +430,153 @@ class _InteractionMotionPointCloud:
         self.get_scene_flow_all = scene_flow
 
 
+def project_environment_motion_mask_to_final_gaussians(viewpoint_camera, motion_mask_path):
+    """Project a prepared 2D environment mask onto final environment Gaussians."""
+    _, env_xyz = gaussians._tmp_get_xyz_all_separate()
+    env_sky_mask = gaussians.is_sky_filter[-env_xyz.shape[0]:]
+    motion_mask = cv2.imread(str(motion_mask_path), cv2.IMREAD_GRAYSCALE)
+    if motion_mask is None:
+        raise FileNotFoundError(f"Environment motion mask not found: {motion_mask_path}")
+
+    uv = proj_uv(env_xyz, viewpoint_camera)
+    camera_rotation = torch.as_tensor(
+        viewpoint_camera.R.T,
+        dtype=env_xyz.dtype,
+        device=env_xyz.device,
+    )
+    camera_translation = torch.as_tensor(
+        viewpoint_camera.T,
+        dtype=env_xyz.dtype,
+        device=env_xyz.device,
+    )
+    camera_xyz = (camera_rotation @ env_xyz.T).T + camera_translation
+    pixel_x = torch.floor(uv[:, 0]).long()
+    pixel_y = torch.floor(uv[:, 1]).long()
+    in_frame = (
+        torch.isfinite(uv).all(dim=1)
+        & (camera_xyz[:, 2] > 1e-6)
+        & (pixel_x >= 0)
+        & (pixel_x < motion_mask.shape[1])
+        & (pixel_y >= 0)
+        & (pixel_y < motion_mask.shape[0])
+    )
+    projected_motion_mask = torch.zeros_like(env_sky_mask, dtype=torch.bool)
+    if in_frame.any():
+        motion_mask_tensor = torch.from_numpy(motion_mask > 0).to(env_xyz.device)
+        projected_motion_mask[in_frame] = motion_mask_tensor[
+            pixel_y[in_frame], pixel_x[in_frame]
+        ]
+
+    environment_mask = (~env_sky_mask) & projected_motion_mask
+    if environment_mask.sum().item() == 0:
+        raise RuntimeError("Interaction scene contains no moving environment Gaussians")
+    return env_xyz.detach(), environment_mask.detach().bool()
+
+
+@torch.no_grad()
+def sync_current_pc_scene_flow_to_final_environment_gaussians(
+    config,
+    viewpoint_camera,
+    motion_mask_path,
+):
+    """Transfer current_pc scene flow onto the final environment Gaussians."""
+    env_xyz, env_motion_mask = project_environment_motion_mask_to_final_gaussians(
+        viewpoint_camera,
+        motion_mask_path,
+    )
+    current_pc = kf_gen.get_current_pc_latest()
+    source_xyz = current_pc["xyz"].to(device=env_xyz.device, dtype=env_xyz.dtype)
+    source_flow = current_pc.get("scene_flow", torch.zeros_like(current_pc["xyz"]))
+    source_flow = source_flow.to(device=env_xyz.device, dtype=env_xyz.dtype)
+    source_motion_mask = current_pc.get(
+        "motion_mask",
+        torch.ones(
+            source_xyz.shape[0],
+            1,
+            dtype=torch.bool,
+            device=source_xyz.device,
+        ),
+    )
+    source_motion_mask = source_motion_mask.to(device=env_xyz.device).bool()
+    if source_motion_mask.ndim > 1:
+        source_motion_mask = source_motion_mask[:, 0]
+
+    scale = float(config.get("interaction", {}).get("xyz_scale", xyz_scale))
+    source_xyz = source_xyz * scale
+    source_flow = source_flow * scale
+
+    source_valid = (
+        source_motion_mask
+        & torch.isfinite(source_xyz).all(dim=1)
+        & torch.isfinite(source_flow).all(dim=1)
+        & (source_flow.norm(dim=1) > 0)
+    )
+    if source_valid.sum().item() == 0:
+        raise RuntimeError("No moving current_pc scene-flow points to transfer")
+
+    source_xyz = source_xyz[source_valid]
+    source_flow = source_flow[source_valid]
+    target_idx = env_motion_mask.nonzero(as_tuple=False).squeeze(1)
+    target_xyz = env_xyz[target_idx]
+
+    env_scene_flow = torch.zeros_like(env_xyz)
+    chunk_size = 256
+    for start in range(0, target_xyz.shape[0], chunk_size):
+        end = min(start + chunk_size, target_xyz.shape[0])
+        dist = torch.cdist(target_xyz[start:end].float(), source_xyz.float())
+        nn_idx = dist.argmin(dim=1)
+        env_scene_flow[target_idx[start:end]] = source_flow[nn_idx].to(env_xyz.dtype)
+
+    base_scene_flow = getattr(gaussians, "_scene_flow", torch.zeros_like(gaussians._xyz))
+    if base_scene_flow.shape[0] != gaussians._xyz.shape[0]:
+        base_scene_flow = torch.zeros_like(gaussians._xyz)
+    base_motion_mask = getattr(
+        gaussians,
+        "_motion_mask",
+        torch.zeros(
+            gaussians._xyz.shape[0],
+            1,
+            dtype=torch.bool,
+            device=gaussians._xyz.device,
+        ),
+    )
+    if base_motion_mask.shape[0] != gaussians._xyz.shape[0]:
+        base_motion_mask = torch.zeros(
+            gaussians._xyz.shape[0],
+            1,
+            dtype=torch.bool,
+            device=gaussians._xyz.device,
+        )
+    elif base_motion_mask.ndim == 1:
+        base_motion_mask = base_motion_mask[:, None]
+    else:
+        base_motion_mask = base_motion_mask[:, :1]
+
+    gaussians._scene_flow = base_scene_flow.detach()
+    gaussians._motion_mask = base_motion_mask.detach().bool()
+    gaussians._scene_flow_prev = env_scene_flow.detach()
+    gaussians._motion_mask_prev = env_motion_mask[:, None].detach().bool()
+    gaussians._scene_flow_all = torch.cat(
+        [gaussians._scene_flow, gaussians._scene_flow_prev], dim=0
+    )
+    gaussians._motion_mask_all = torch.cat(
+        [gaussians._motion_mask, gaussians._motion_mask_prev], dim=0
+    )
+
+    moving_flow = env_scene_flow[env_motion_mask]
+    print(
+        "[interaction] Transferred current_pc scene flow to final environment "
+        f"Gaussians: {int(env_motion_mask.sum().item())}/{env_motion_mask.numel()} "
+        f"points, source={int(source_valid.sum().item())}, xyz_scale={scale:g}"
+    )
+    print(
+        "[interaction-debug] transferred env flow stats:",
+        f"abs_mean={moving_flow.abs().mean(dim=0).detach().cpu().numpy()}",
+        f"max={moving_flow.abs().max(dim=0).values.detach().cpu().numpy()}",
+    )
+    return env_xyz, env_motion_mask, env_scene_flow
+
+
 def validate_interaction_config(config):
     interaction = config.get("interaction", {})
     direction = str(interaction.get("direction", "")).lower()
@@ -455,10 +602,11 @@ def train_interaction_motion_model(config):
     scale = float(config.get("interaction", {}).get("xyz_scale", xyz_scale))
     source = "current_pc_scaled"
 
-    if direction == "env2obj" and gaussians is not None:
+    if direction in {"env2obj", "obj2env"} and gaussians is not None:
         try:
             _, env_xyz = gaussians._tmp_get_xyz_all_separate()
             scene_flow_all = gaussians.get_scene_flow_all.detach()
+            motion_mask_all = gaussians.get_motion_mask_all.detach()
             env_count = env_xyz.shape[0]
             total_count = gaussians.get_xyz_all.shape[0]
             if scene_flow_all.shape[0] == total_count:
@@ -470,9 +618,31 @@ def train_interaction_motion_model(config):
                     f"scene_flow length {scene_flow_all.shape[0]} does not match "
                     f"total={total_count} or env={env_count}"
                 )
-            xyz = env_xyz.detach()
-            scene_flow = env_scene_flow
-            source = "gaussians_env"
+            if motion_mask_all.shape[0] == total_count:
+                env_motion_mask = motion_mask_all[-env_count:]
+            elif motion_mask_all.shape[0] == env_count:
+                env_motion_mask = motion_mask_all
+            else:
+                env_motion_mask = torch.ones(
+                    env_count,
+                    1,
+                    dtype=torch.bool,
+                    device=env_xyz.device,
+                )
+            if env_motion_mask.ndim > 1:
+                env_motion_mask = env_motion_mask[:, 0]
+            env_motion_mask = env_motion_mask.bool()
+
+            if direction == "obj2env":
+                if env_motion_mask.sum().item() == 0:
+                    raise RuntimeError("obj2env has no moving final environment Gaussians")
+                xyz = env_xyz[env_motion_mask].detach()
+                scene_flow = env_scene_flow[env_motion_mask]
+                source = "gaussians_env_motion_mask"
+            else:
+                xyz = env_xyz.detach()
+                scene_flow = env_scene_flow
+                source = "gaussians_env"
         except Exception as exc:
             print(
                 "[interaction] WARNING: failed to train HashGrid from Gaussian "
@@ -499,7 +669,11 @@ def train_interaction_motion_model(config):
     )
     motion_pc = _InteractionMotionPointCloud(xyz, scene_flow)
     motion_model = HashEncoderMotionModel().to(config["device"])
-    return train_hashgrid(motion_pc, motion_model, iterations=100)
+    motion_model = train_hashgrid(motion_pc, motion_model, iterations=100)
+    motion_model._interaction_train_source = source
+    motion_model._interaction_train_xyz_count = int(xyz.shape[0])
+    motion_model._interaction_train_xyz_mean = xyz.detach().mean(dim=0)
+    return motion_model
 
 
 def get_interaction_query_points(save_dir, config=None):
@@ -569,7 +743,7 @@ def generate_object_motion_hints(simulation_states, viewpoint_camera):
         raise RuntimeError("obj2env requires at least two visible Genesis states")
     object_key = "obj_0000"
     xyz_start = simulation_states[0][object_key]["xyz"]
-    xyz_end = simulation_states[1][object_key]["xyz"]
+    xyz_end = simulation_states[-1][object_key]["xyz"]
     center_start = xyz_start.mean(dim=0, keepdim=True)
     center_end = xyz_end.mean(dim=0, keepdim=True)
     uv_start = proj_uv(center_start, viewpoint_camera)[0]
@@ -678,45 +852,21 @@ def precompute_interaction_environment_positions(
     motion_mask_path,
 ):
     """Integrate HashGrid displacement for environment points while keeping sky static."""
-    _, env_xyz = gaussians._tmp_get_xyz_all_separate()
-    env_sky_mask = gaussians.is_sky_filter[-env_xyz.shape[0]:]
-    motion_mask = cv2.imread(str(motion_mask_path), cv2.IMREAD_GRAYSCALE)
-    if motion_mask is None:
-        raise FileNotFoundError(f"Environment motion mask not found: {motion_mask_path}")
-
-    uv = proj_uv(env_xyz, viewpoint_camera)
-    camera_rotation = torch.as_tensor(
-        viewpoint_camera.R.T,
-        dtype=env_xyz.dtype,
-        device=env_xyz.device,
+    env_xyz, environment_mask = project_environment_motion_mask_to_final_gaussians(
+        viewpoint_camera,
+        motion_mask_path,
     )
-    camera_translation = torch.as_tensor(
-        viewpoint_camera.T,
-        dtype=env_xyz.dtype,
-        device=env_xyz.device,
-    )
-    camera_xyz = (camera_rotation @ env_xyz.T).T + camera_translation
-    pixel_x = torch.floor(uv[:, 0]).long()
-    pixel_y = torch.floor(uv[:, 1]).long()
-    in_frame = (
-        torch.isfinite(uv).all(dim=1)
-        & (camera_xyz[:, 2] > 1e-6)
-        & (pixel_x >= 0)
-        & (pixel_x < motion_mask.shape[1])
-        & (pixel_y >= 0)
-        & (pixel_y < motion_mask.shape[0])
-    )
-    projected_motion_mask = torch.zeros_like(env_sky_mask, dtype=torch.bool)
-    if in_frame.any():
-        motion_mask_tensor = torch.from_numpy(motion_mask > 0).to(env_xyz.device)
-        projected_motion_mask[in_frame] = motion_mask_tensor[
-            pixel_y[in_frame], pixel_x[in_frame]
-        ]
-
-    environment_mask = (~env_sky_mask) & projected_motion_mask
     environment_points = env_xyz[environment_mask]
     if environment_points.shape[0] == 0:
         raise RuntimeError("Interaction scene contains no moving environment Gaussians")
+
+    train_source = getattr(motion_model, "_interaction_train_source", None)
+    train_count = getattr(motion_model, "_interaction_train_xyz_count", None)
+    if train_source == "gaussians_env_motion_mask" and train_count != environment_points.shape[0]:
+        raise RuntimeError(
+            "HashGrid Train XYZ and render query XYZ are not aligned: "
+            f"train={train_count}, render={environment_points.shape[0]}"
+        )
     
     print(
         f"[interaction-debug] environment_mask count = "
@@ -963,10 +1113,13 @@ def run_interaction_pipeline(
             config,
             fixed_hints_override=generated_hints,
         )
+        sync_current_pc_scene_flow_to_final_environment_gaussians(
+            config,
+            viewpoint_camera,
+            save_dir / "sam3_mask.png",
+        )
         motion_model = train_interaction_motion_model(config)
 
-        # Reproject the prepared 2D motion mask onto the final Gaussian
-        # environment points so the renderer sees the same moving water region.
         env_xyz, env_motion_mask, forward_positions = precompute_interaction_environment_positions(
             motion_model,
             num_frames,
@@ -979,20 +1132,8 @@ def run_interaction_pipeline(
             viewpoint_camera,
             save_dir / "sam3_mask.png",
         )
-        env_scene_flow = forward_positions[-1] - forward_positions[0]
-        scene_flow_prev = torch.zeros_like(env_xyz)
-        scene_flow_prev[env_motion_mask] = env_scene_flow
-
-        gaussians._scene_flow_prev = scene_flow_prev.detach()
-        gaussians._motion_mask_prev = env_motion_mask[:, None].detach().bool()
-        gaussians._scene_flow_all = torch.cat(
-            [gaussians._scene_flow.detach(), gaussians._scene_flow_prev], dim=0
-        )
-        gaussians._motion_mask_all = torch.cat(
-            [gaussians._motion_mask.detach().bool(), gaussians._motion_mask_prev], dim=0
-        )
         print(
-            "[interaction] Synced environment motion to final Gaussians: "
+            "[interaction] HashGrid train/render XYZ aligned on final Gaussians: "
             f"{int(env_motion_mask.sum().item())}/{env_motion_mask.numel()} points"
         )
 
