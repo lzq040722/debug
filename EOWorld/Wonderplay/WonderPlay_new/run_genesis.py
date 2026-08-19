@@ -728,7 +728,7 @@ def precompute_interaction_environment_positions(
     smooth = (
         1.2
         / integration_steps
-        * torch.tensor([0.5, 0.5, 2.3], device=env_xyz.device)
+        * torch.tensor([0.5, 0.5, 1.3], device=env_xyz.device)
         * scale_factor
     )
     forward_positions, _ = pre_euler_integral(
@@ -914,6 +914,7 @@ def run_interaction_pipeline(
     video_gen_fps,
 ):
     direction, velocity_scale = validate_interaction_config(config)
+    interaction = config.get("interaction", {})
     num_frames = int(config.get("interaction", {}).get("num_frames", 50))
     if num_frames < 2:
         raise ValueError("interaction.num_frames must be at least 2")
@@ -963,6 +964,37 @@ def run_interaction_pipeline(
             fixed_hints_override=generated_hints,
         )
         motion_model = train_interaction_motion_model(config)
+
+        # Reproject the prepared 2D motion mask onto the final Gaussian
+        # environment points so the renderer sees the same moving water region.
+        env_xyz, env_motion_mask, forward_positions = precompute_interaction_environment_positions(
+            motion_model,
+            num_frames,
+            float(
+                interaction.get(
+                    "environment_scale_factor",
+                    config.get("environment_motion", {}).get("scale_factor", 1.0),
+                )
+            ),
+            viewpoint_camera,
+            save_dir / "sam3_mask.png",
+        )
+        env_scene_flow = forward_positions[-1] - forward_positions[0]
+        scene_flow_prev = torch.zeros_like(env_xyz)
+        scene_flow_prev[env_motion_mask] = env_scene_flow
+
+        gaussians._scene_flow_prev = scene_flow_prev.detach()
+        gaussians._motion_mask_prev = env_motion_mask[:, None].detach().bool()
+        gaussians._scene_flow_all = torch.cat(
+            [gaussians._scene_flow.detach(), gaussians._scene_flow_prev], dim=0
+        )
+        gaussians._motion_mask_all = torch.cat(
+            [gaussians._motion_mask.detach().bool(), gaussians._motion_mask_prev], dim=0
+        )
+        print(
+            "[interaction] Synced environment motion to final Gaussians: "
+            f"{int(env_motion_mask.sum().item())}/{env_motion_mask.numel()} points"
+        )
 
     interaction_rendering(
         simulation_states,

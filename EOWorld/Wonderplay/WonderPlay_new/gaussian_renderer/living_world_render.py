@@ -498,7 +498,7 @@ def render_interaction_mlp(
             smooth = (
                 1.2
                 / T
-                * torch.tensor([0.5, 0.5, 0.5], device=means3D.device)
+                * torch.tensor([0.5, 0.5, 1.3], device=means3D.device)
                 * scale_factor
             )
             cache_key = (
