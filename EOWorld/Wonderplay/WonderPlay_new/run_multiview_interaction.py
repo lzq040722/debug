@@ -37,6 +37,7 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 _runtime_lock = threading.Lock()
 _annotation_event = threading.Event()
 _mask_review_event = threading.Event()
+_object_selection_event = threading.Event()
 _expansion_event = threading.Event()
 _stop_event = threading.Event()
 _record_lock = threading.Lock()
@@ -44,6 +45,7 @@ _frame_lock = threading.Lock()
 _client_lock = threading.Lock()
 _client_ids = set()
 _annotation_lock = threading.Lock()
+_object_selection_lock = threading.Lock()
 _phase_lock = threading.Lock()
 _view_lock = threading.Lock()
 _playback_lock = threading.Lock()
@@ -52,6 +54,8 @@ _phase_message = "Pipeline is initializing."
 _view_matrix = list(genesis.view_matrix_wonder)
 _expansion_request = None
 _last_emitted_frame_info = None
+_last_preview_frame_bytes = None
+_last_preview_frame_info = None
 _fixed_view_matrix = np.array(
     [
         [-1, 0, 0, 0],
@@ -95,6 +99,11 @@ _interaction_fps = 8.0
 _refined_preview_frames = []
 _refined_frame_index = 0
 _annotation_live_preview = False
+_object_selection_image = None
+_object_selection_predictor = None
+_object_selection_points = []
+_object_selection_labels = []
+_object_selection_mask = None
 
 
 @app.route("/")
@@ -191,6 +200,55 @@ def _reset_annotations():
     with _annotation_lock:
         _clicks.clear()
         _confirmed_clicks.clear()
+
+
+def _object_mask_overlay(image, mask, points, labels):
+    array = np.asarray(image.convert("RGB")).copy()
+    if mask is not None:
+        selected = np.asarray(mask).astype(bool)
+        array[selected] = (
+            array[selected].astype(np.float32) * 0.35
+            + np.array([30, 144, 255], dtype=np.float32) * 0.65
+        ).astype(np.uint8)
+    for (x, y), label in zip(points, labels):
+        color = (30, 220, 80) if label == 1 else (235, 50, 65)
+        cv2.circle(array, (int(x), int(y)), 5, color, -1, lineType=cv2.LINE_AA)
+        cv2.circle(array, (int(x), int(y)), 7, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+    return Image.fromarray(array)
+
+
+def _select_object_mask(image, local_predictor=None):
+    """Block the reconstruction at its existing mask-selection point."""
+    global _object_selection_image, _object_selection_predictor
+    global _object_selection_mask
+
+    image = image.convert("RGB")
+    with _object_selection_lock:
+        _object_selection_image = image.copy()
+        _object_selection_predictor = local_predictor
+        _object_selection_points.clear()
+        _object_selection_labels.clear()
+        _object_selection_mask = None
+    _object_selection_event.clear()
+    _set_annotation_frame(image)
+    _set_pipeline_phase(
+        "OBJECT_SELECTION",
+        "Click the moving object. Shift-click excludes background; then Confirm.",
+    )
+
+    runtime = getattr(genesis, "auxiliary_model_runtime", None)
+    if runtime is not None:
+        runtime.set_object_image(image, local_predictor=local_predictor)
+    elif local_predictor is not None:
+        local_predictor.set_image(np.asarray(image))
+
+    _object_selection_event.wait()
+    with _object_selection_lock:
+        if _object_selection_mask is None:
+            raise RuntimeError("Object selection was confirmed without a valid mask")
+        selected_mask = np.asarray(_object_selection_mask).astype(bool).copy()
+    _set_pipeline_phase("PROCESSING", "Object mask confirmed. Reconstructing scene...")
+    return [selected_mask]
 
 
 def _review_motion_mask(image):
@@ -403,10 +461,13 @@ def _clear_interaction_preview():
 
 
 def _emit_frame(frame_bytes, source, frame_index=None):
-    global _last_emitted_frame_info
+    global _last_emitted_frame_info, _last_preview_frame_bytes
+    global _last_preview_frame_info
     frame_info = {"source": source, "frame_index": frame_index}
     with _playback_lock:
         _last_emitted_frame_info = frame_info
+        _last_preview_frame_bytes = frame_bytes
+        _last_preview_frame_info = frame_info
     _emit("frame-info", frame_info)
     _emit("frame", frame_bytes)
 
@@ -454,13 +515,32 @@ def _handle_connect():
     with _client_lock:
         _client_ids.add(request.sid)
     emit("scale-state", {"value": _scale_factor}, room=request.sid)
-    if _annotation_frame_bytes is not None:
-        emit("annotation-frame", _annotation_frame_bytes, room=request.sid)
     if isinstance(genesis.scene_dict, dict):
         emit("scene-prompt", genesis.scene_dict.get("scene_name", ""), room=request.sid)
     # A reconnect must restore the active phase so the relevant controls are
     # enabled again.  A generic "connected" message loses that information.
     phase, phase_message = _get_pipeline_phase()
+    show_annotation_frame = (
+        phase == "INITIALIZING"
+        or phase == "OBJECT_SELECTION"
+        or (
+            phase in {"PREPARING_ANNOTATION", "WAITING_ANNOTATION"}
+            and not _annotation_live_preview
+        )
+        or phase in {"PREPARING_MASK_REVIEW", "MASK_REVIEW"}
+    )
+    with _frame_lock:
+        annotation_frame_bytes = _annotation_frame_bytes
+    with _playback_lock:
+        preview_frame_bytes = _last_preview_frame_bytes
+        preview_frame_info = _last_preview_frame_info
+    if show_annotation_frame and annotation_frame_bytes is not None:
+        emit("annotation-frame", annotation_frame_bytes, room=request.sid)
+    elif preview_frame_bytes is not None:
+        # Reconnects during PROCESSING or WAITING_EXPANSION should restore the
+        # last scene frame, never the original input image.
+        emit("frame-info", preview_frame_info, room=request.sid)
+        emit("frame", preview_frame_bytes, room=request.sid)
     emit(
         "pipeline-phase",
         {"phase": phase, "message": phase_message},
@@ -478,6 +558,8 @@ def _handle_disconnect():
 @socketio.on("start")
 def _handle_start(data=None):
     phase, phase_message = _get_pipeline_phase()
+    if phase == "OBJECT_SELECTION":
+        return handle_object_selection({"action": "confirm"})
     if phase in {"MASK_REVIEW", "WAITING_ANNOTATION"}:
         return handle_ok_start(data)
     emit("server-state", phase_message, room=request.sid)
@@ -522,6 +604,92 @@ def handle_new_prompt(data):
     genesis.scene_name = data
     if isinstance(genesis.scene_dict, dict):
         genesis.scene_dict["scene_name"] = data
+
+
+@socketio.on("object-selection")
+def handle_object_selection(msg):
+    global _object_selection_mask
+
+    phase, phase_message = _get_pipeline_phase()
+    if phase != "OBJECT_SELECTION":
+        return {"ok": False, "message": f"Object selection rejected: {phase_message}"}
+    msg = msg or {}
+    action = str(msg.get("action", "point")).lower()
+
+    if action == "confirm":
+        with _object_selection_lock:
+            valid = _object_selection_mask is not None and bool(
+                np.asarray(_object_selection_mask).any()
+            )
+        if not valid:
+            return {"ok": False, "message": "Click the object before confirming."}
+        _object_selection_event.set()
+        return {"ok": True, "message": "Object mask confirmed."}
+
+    with _object_selection_lock:
+        if action == "clear":
+            _object_selection_points.clear()
+            _object_selection_labels.clear()
+            _object_selection_mask = None
+        elif action == "undo":
+            if _object_selection_points:
+                _object_selection_points.pop()
+                _object_selection_labels.pop()
+            _object_selection_mask = None
+        elif action == "point":
+            xy = msg.get("xy")
+            if xy is None or len(xy) != 2:
+                return {"ok": False, "message": "Object selection point is missing."}
+            width, height = msg.get("size", [512, 512])
+            source_width, source_height = _object_selection_image.size
+            x = int(round(float(xy[0]) * source_width / max(1, int(width))))
+            y = int(round(float(xy[1]) * source_height / max(1, int(height))))
+            x = max(0, min(source_width - 1, x))
+            y = max(0, min(source_height - 1, y))
+            _object_selection_points.append((x, y))
+            _object_selection_labels.append(0 if int(msg.get("label", 1)) == 0 else 1)
+        else:
+            return {"ok": False, "message": f"Unknown object-selection action: {action}"}
+        points = list(_object_selection_points)
+        labels = list(_object_selection_labels)
+        image = _object_selection_image.copy()
+        predictor = _object_selection_predictor
+
+    if points:
+        try:
+            runtime = getattr(genesis, "auxiliary_model_runtime", None)
+            if runtime is not None:
+                mask = runtime.segment_object(points, labels, local_predictor=predictor)
+            elif predictor is not None:
+                masks, scores, _ = predictor.predict(
+                    point_coords=np.asarray(points, dtype=np.float32),
+                    point_labels=np.asarray(labels, dtype=np.int32),
+                    multimask_output=True,
+                )
+                mask = masks[int(np.argmax(scores))]
+            else:
+                raise RuntimeError("SAM predictor is not available")
+        except Exception as exc:
+            return {"ok": False, "message": f"Object segmentation failed: {exc}"}
+        with _object_selection_lock:
+            if (
+                points != _object_selection_points
+                or labels != _object_selection_labels
+            ):
+                return {
+                    "ok": True,
+                    "message": "A newer object-selection update is being processed.",
+                }
+            _object_selection_mask = np.asarray(mask).astype(bool)
+            mask = _object_selection_mask.copy()
+    else:
+        mask = None
+
+    _set_annotation_frame(_object_mask_overlay(image, mask, points, labels))
+    return {
+        "ok": True,
+        "message": f"Object mask updated with {len(points)} point(s).",
+    }
 
 
 @socketio.on("sam-toggle")
@@ -585,6 +753,8 @@ def handle_ok_start(data=None):
         f"event_data={'present' if data is not None else 'none'}",
         flush=True,
     )
+    if phase == "OBJECT_SELECTION":
+        return handle_object_selection({"action": "confirm"})
     if phase == "MASK_REVIEW":
         message = "SAM3 mask confirmed. Computing motion flow..."
         _set_pipeline_phase("PROCESSING", message)
@@ -730,8 +900,16 @@ def _interaction_scale_factor():
     )
 
 
-def _render_interaction_frame(tdgs_camera, frame_index):
-    state = _interaction_simulation_states[frame_index]
+def _render_interaction_frame(
+    tdgs_camera,
+    frame_index,
+    state=None,
+    motion_model=None,
+):
+    if state is None:
+        state = _interaction_simulation_states[frame_index]
+    if motion_model is None:
+        motion_model = _interaction_motion_model
     obj_xyz_t = state["obj_0000"]["xyz"]
     refinement = state.get("_video_refinement")
     render_timestep = frame_index
@@ -749,7 +927,7 @@ def _render_interaction_frame(tdgs_camera, frame_index):
     render_pkg = genesis.render_interaction_mlp(
         viewpoint_camera=tdgs_camera,
         pc=genesis.gaussians,
-        motion_model=_interaction_motion_model,
+        motion_model=motion_model,
         obj_xyz_t=obj_xyz_t,
         t=render_timestep,
         opt=genesis.opt,
@@ -824,15 +1002,11 @@ def render_current_scene():
     while not _stop_event.is_set():
         try:
             phase, _ = _get_pipeline_phase()
-            has_refined_preview = len(_refined_preview_frames) > 0
-            has_interaction_preview = (
-                _interaction_motion_model is not None
-                and len(_interaction_simulation_states) > 0
-            )
             show_annotation_frame = (
-                phase in {"INITIALIZING", "PREPARING_ANNOTATION"}
+                phase == "INITIALIZING"
+                or phase == "OBJECT_SELECTION"
                 or (
-                    phase == "WAITING_ANNOTATION"
+                    phase in {"PREPARING_ANNOTATION", "WAITING_ANNOTATION"}
                     and not _annotation_live_preview
                 )
                 or phase in {"PREPARING_MASK_REVIEW", "MASK_REVIEW"}
@@ -855,10 +1029,21 @@ def render_current_scene():
                 time.sleep(0.01)
                 continue
 
-            if has_refined_preview:
-                frame_index = _refined_frame_index % len(_refined_preview_frames)
-                image_np, frame_bytes = _refined_preview_frames[frame_index]
-                _refined_frame_index = (frame_index + 1) % len(_refined_preview_frames)
+            refined_preview = None
+            with _playback_lock:
+                if _refined_preview_frames:
+                    frame_index = _refined_frame_index % len(
+                        _refined_preview_frames
+                    )
+                    refined_preview = (
+                        frame_index,
+                        _refined_preview_frames[frame_index],
+                    )
+                    _refined_frame_index = (frame_index + 1) % len(
+                        _refined_preview_frames
+                    )
+            if refined_preview is not None:
+                frame_index, (image_np, frame_bytes) = refined_preview
                 _record_preview_frame(image_np)
                 _emit_frame(frame_bytes, "refined", frame_index)
                 _interaction_last_emit = now
@@ -873,21 +1058,42 @@ def render_current_scene():
                     camera, xyz_scale=genesis.xyz_scale
                 )
 
-                if has_interaction_preview:
-                    frame_index = _interaction_frame_index % len(
-                        _interaction_simulation_states
+                interaction_preview = None
+                with _playback_lock:
+                    if (
+                        _interaction_motion_model is not None
+                        and _interaction_simulation_states
+                    ):
+                        frame_index = _interaction_frame_index % len(
+                            _interaction_simulation_states
+                        )
+                        interaction_preview = (
+                            frame_index,
+                            _interaction_simulation_states[frame_index],
+                            _interaction_motion_model,
+                        )
+                        _interaction_frame_index = (frame_index + 1) % len(
+                            _interaction_simulation_states
+                        )
+
+                if interaction_preview is not None:
+                    frame_index, interaction_state, motion_model = (
+                        interaction_preview
                     )
                     image_np, rendered_frame = _render_interaction_frame(
-                        tdgs_camera, frame_index
+                        tdgs_camera,
+                        frame_index,
+                        state=interaction_state,
+                        motion_model=motion_model,
                     )
 
                     fixed_tdgs_camera = _fixed_overview_camera()
                     _, rendered_viz = _render_interaction_frame(
-                        fixed_tdgs_camera, frame_index
+                        fixed_tdgs_camera,
+                        frame_index,
+                        state=interaction_state,
+                        motion_model=motion_model,
                     )
-                    _interaction_frame_index = (
-                        frame_index + 1
-                    ) % len(_interaction_simulation_states)
                 else:
                     image_np, rendered_frame = _render_static_frame(tdgs_camera)
                     _, rendered_viz = _render_static_frame(_fixed_overview_camera())
@@ -901,6 +1107,7 @@ def render_current_scene():
                     can_emit_annotation_preview
                     or phase not in {"PREPARING_ANNOTATION", "WAITING_ANNOTATION"}
                 ):
+                    has_interaction_preview = interaction_preview is not None
                     frame_source = "interaction" if has_interaction_preview else "static"
                     emitted_frame_index = frame_index if has_interaction_preview else None
                     _emit_frame(rendered_frame, frame_source, emitted_frame_index)
@@ -926,12 +1133,16 @@ def run(config, prefix=None, port=5000):
     global _interaction_motion_model, _interaction_simulation_states
     global _interaction_frame_index, _interaction_last_emit, _annotation_live_preview
     global _expansion_request, _last_emitted_frame_info
+    global _last_preview_frame_bytes, _last_preview_frame_info
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
     genesis_runtime_config = config
     config["multiview"]["enabled"] = True
     config["multiview"]["stop"] = False
     _stop_event.clear()
     _annotation_event.clear()
     _mask_review_event.clear()
+    _object_selection_event.clear()
     _expansion_event.clear()
     _reset_annotations()
     _interaction_motion_model = None
@@ -941,6 +1152,8 @@ def run(config, prefix=None, port=5000):
     _annotation_live_preview = False
     _expansion_request = None
     _last_emitted_frame_info = None
+    _last_preview_frame_bytes = None
+    _last_preview_frame_info = None
     _pipeline_phase = "INITIALIZING"
     _phase_message = "Pipeline is initializing."
     _sam_prompt = str(config.get("environment_motion", {}).get("sam_prompt", "water"))
@@ -974,9 +1187,18 @@ def run(config, prefix=None, port=5000):
     render_thread = threading.Thread(target=render_current_scene, daemon=True)
     render_thread.start()
 
+    from auxiliary_runtime import build_auxiliary_runtime
+
+    auxiliary_runtime = build_auxiliary_runtime(config)
     try:
+        genesis.auxiliary_model_runtime = auxiliary_runtime
+        genesis.object_mask_selector = _select_object_mask
         genesis.run(config, dt_string=prefix)
     finally:
+        genesis.object_mask_selector = None
+        genesis.auxiliary_model_runtime = None
+        if auxiliary_runtime is not None:
+            auxiliary_runtime.close()
         _stop_event.set()
         with _record_lock:
             _capture_active = False

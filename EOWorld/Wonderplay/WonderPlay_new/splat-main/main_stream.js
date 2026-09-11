@@ -108,20 +108,48 @@ function setMotionAnnotation(enabled) {
     }
 }
 
+function showAnnotationLayer() {
+    annotationImage.style.visibility = "visible";
+    canvas.style.visibility = "hidden";
+}
+
+function showSceneLayer() {
+    annotationImage.style.visibility = "hidden";
+    canvas.style.visibility = "visible";
+}
+
 function applyPipelinePhase(phase) {
     pipelinePhase = phase;
+    const selectingObject = phase === "OBJECT_SELECTION";
     const waitingForOk = phase === "WAITING_ANNOTATION";
     const reviewingMask = phase === "MASK_REVIEW";
     const waitingToGenerate = phase === "WAITING_EXPANSION";
 
-    annotationImage.style.visibility = waitingToGenerate ? "hidden" : "visible";
-    canvas.style.visibility = waitingToGenerate ? "visible" : "hidden";
+    // A phase transition controls the available actions, not the displayed
+    // image.  In particular, PROCESSING must keep the frame on which Generate
+    // or Confirm was clicked instead of exposing the original input layer.
+    if (selectingObject || waitingForOk || waitingToGenerate) {
+        holdPreviewFrame = false;
+    }
+    if (selectingObject) {
+        showAnnotationLayer();
+    }
+    if (waitingToGenerate) {
+        showSceneLayer();
+    }
 
-    start_button.disabled = !(waitingForOk || reviewingMask);
+    start_button.disabled = !(selectingObject || waitingForOk || reviewingMask);
     generate_button.disabled = !waitingToGenerate;
     motion_toggle.disabled = !waitingForOk;
     sam_prompt_button.disabled = !waitingForOk;
-    clear_motion_button.disabled = !waitingForOk;
+    clear_motion_button.disabled = !(selectingObject || waitingForOk);
+    if (selectingObject) {
+        motion_overlay.style.pointerEvents = "auto";
+        motion_overlay.classList.add("enabled");
+    } else if (!motionEnabled) {
+        motion_overlay.style.pointerEvents = "none";
+        motion_overlay.classList.remove("enabled");
+    }
 
     if (!waitingForOk && motionEnabled) {
         motion_toggle.checked = false;
@@ -142,6 +170,7 @@ function generateFromCurrentView() {
         displayed_frame: lastDisplayedFrame,
     };
     holdPreviewFrame = true;
+    pendingFrameInfo = null;
     activeKeys = [];
     generate_button.disabled = true;
     serverConnect.innerText = "Generating new scene...";
@@ -177,17 +206,27 @@ function confirmMotionAnnotations() {
         serverConnect.innerText = "Cannot confirm: Socket.IO is disconnected.";
         return;
     }
+    const selectingObject = pipelinePhase === "OBJECT_SELECTION";
+    holdPreviewFrame = true;
+    pendingFrameInfo = null;
+    activeKeys = [];
     start_button.disabled = true;
-    serverConnect.innerText = pipelinePhase === "MASK_REVIEW"
+    serverConnect.innerText = selectingObject
+        ? "Confirming object mask..."
+        : pipelinePhase === "MASK_REVIEW"
         ? "Confirming SAM3 mask..."
         : `Submitting ${motionArrows.length} motion arrow(s)...`;
-    socket.timeout(5000).emit("ok-start", { arrows: motionArrows }, (error, response) => {
+    const eventName = selectingObject ? "object-selection" : "ok-start";
+    const payload = selectingObject ? { action: "confirm" } : { arrows: motionArrows };
+    socket.timeout(5000).emit(eventName, payload, (error, response) => {
         if (error) {
+            holdPreviewFrame = false;
             serverConnect.innerText = "Confirm was not acknowledged by the server. Retry.";
             start_button.disabled = false;
             return;
         }
         if (!response || response.ok !== true) {
+            holdPreviewFrame = false;
             serverConnect.innerText = (response && response.message) || "Confirm was rejected.";
             start_button.disabled = false;
             return;
@@ -197,6 +236,30 @@ function confirmMotionAnnotations() {
 }
 
 motion_overlay.addEventListener("pointerdown", (event) => {
+    if (pipelinePhase === "OBJECT_SELECTION") {
+        event.preventDefault();
+        const point = getCanvasPoint(event);
+        const label = event.shiftKey || event.button === 2 ? 0 : 1;
+        socket.timeout(30000).emit(
+            "object-selection",
+            {
+                action: "point",
+                xy: [Math.round(point.x), Math.round(point.y)],
+                size: [motion_overlay.width, motion_overlay.height],
+                label,
+            },
+            (error, response) => {
+                if (error || !response || response.ok !== true) {
+                    serverConnect.innerText = response && response.message
+                        ? response.message
+                        : "Object segmentation was not acknowledged.";
+                } else {
+                    serverConnect.innerText = response.message;
+                }
+            },
+        );
+        return;
+    }
     if (!motionEnabled) return;
     event.preventDefault();
     motion_overlay.setPointerCapture(event.pointerId);
@@ -225,6 +288,10 @@ motion_overlay.addEventListener("pointerup", (event) => {
 motion_overlay.addEventListener("pointercancel", () => {
     pendingArrow = null;
     redrawMotionOverlay();
+});
+
+motion_overlay.addEventListener("contextmenu", (event) => {
+    if (pipelinePhase === "OBJECT_SELECTION") event.preventDefault();
 });
 
 const cameras = [
@@ -404,7 +471,7 @@ function connectToServer() {
         const imageURL = URL.createObjectURL(blob);
         const img = new Image();
         img.onload = () => {
-            if (holdPreviewFrame && (!frameInfo || frameInfo.source !== "annotation")) {
+            if (holdPreviewFrame) {
                 URL.revokeObjectURL(imageURL);
                 return;
             }
@@ -425,25 +492,26 @@ function connectToServer() {
     });
 
     socket.on('frame', (data) => {
-        if (holdPreviewFrame) return;
         const frameInfo = pendingFrameInfo;
         pendingFrameInfo = null;
-        annotationImage.style.visibility = "hidden";
-        canvas.style.visibility = "visible";
+        if (holdPreviewFrame) return;
+        showSceneLayer();
         drawFrame(data, 'image/jpeg', frameInfo);
     });
 
     socket.on('annotation-frame', (data) => {
-        holdPreviewFrame = false;
+        // Annotation frames are only for the initial annotation step.  Ignore
+        // any already-queued copy while an operation is holding the current
+        // scene frame.
+        if (holdPreviewFrame) return;
         const blob = new Blob([data], { type: 'image/png' });
         const imageURL = URL.createObjectURL(blob);
         annotationImage.onload = () => URL.revokeObjectURL(imageURL);
         annotationImage.src = imageURL;
-        annotationImage.style.visibility = "visible";
+        showAnnotationLayer();
         // Draw the same fixed input frame into the canvas as a compatibility
         // path for browsers that do not repaint an image layer immediately.
         drawFrame(data, 'image/png', { source: "annotation", frame_index: null });
-        canvas.style.visibility = "visible";
     });
 
     socket.on('viz', (data) => {
@@ -542,7 +610,13 @@ async function main() {
 
     start_button.addEventListener("click", confirmMotionAnnotations);
     generate_button.addEventListener("click", generateFromCurrentView);
-    undo_button.addEventListener("click", () => socket.emit("undo"));
+    undo_button.addEventListener("click", () => {
+        if (pipelinePhase === "OBJECT_SELECTION") {
+            socket.emit("object-selection", { action: "undo" });
+        } else {
+            socket.emit("undo");
+        }
+    });
     save_button.addEventListener("click", () => socket.emit("save"));
     fill_button.addEventListener("click", () => socket.emit("fill_hole"));
     delete_button.addEventListener("click", () => socket.emit("delete", viewMatrix));
@@ -562,6 +636,10 @@ async function main() {
         );
     });
     clear_motion_button.addEventListener("click", () => {
+        if (pipelinePhase === "OBJECT_SELECTION") {
+            socket.emit("object-selection", { action: "clear" });
+            return;
+        }
         motionArrows = [];
         pendingArrow = null;
         redrawMotionOverlay();

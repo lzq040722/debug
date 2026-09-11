@@ -9,6 +9,7 @@ import copy
 import json
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -212,6 +213,42 @@ class ExpansionManager:
         outpaint_mask = dilation(outpaint_mask, kernel=torch.ones(7, 7).cuda())
         return render_pkg, condition_image, fill_mask, outpaint_mask
 
+    def _selected_object_mask_for_view(self, viewpoint_camera, object_xyz):
+        """Project the frontend-selected object into the current view.
+
+        The selection remains the source of truth; rendering the object-only
+        Gaussian subset merely accounts for camera motion during multiview
+        expansion instead of copying the original 2D mask at the wrong pixels.
+        """
+        g = self.genesis
+        if g.kf_gen.selected_object_masks is None:
+            return None
+        if object_xyz is None:
+            object_xyz = g.current_object_xyz
+        if object_xyz is None:
+            return None
+        object_xyz_static, _ = g.gaussians._tmp_get_xyz_all_separate()
+        object_count = object_xyz_static.shape[0]
+        total_count = g.gaussians.get_xyz_all.shape[0]
+        render_mask = torch.zeros(
+            total_count, dtype=torch.bool, device=self.config["device"]
+        )
+        render_mask[:object_count] = True
+        with torch.no_grad():
+            object_render = g.render(
+                viewpoint_camera,
+                g.gaussians,
+                g.opt,
+                g.background,
+                timestep=0,
+                movement_sim=[object_xyz],
+                render_mask=render_mask,
+            )
+        opacity = object_render["final_opacity"].detach().squeeze()
+        if opacity.ndim != 2:
+            raise RuntimeError("Projected object opacity must be a 2D image")
+        return [opacity.cpu().numpy() > 0.01]
+
     def expand(self, viewpoint_camera, prompt, scene_name=None, object_xyz=None):
         g = self.genesis
         kf_gen = g.kf_gen
@@ -295,6 +332,35 @@ class ExpansionManager:
 
         kf_gen.set_current_camera(viewpoint_camera, archive_camera=True)
         if self.config.get("gen_layer", False):
+            selected_view_masks = self._selected_object_mask_for_view(
+                viewpoint_camera, object_xyz
+            )
+            if (
+                selected_view_masks is None
+                and getattr(kf_gen, "defer_object_selection_until_expansion", False)
+                and getattr(kf_gen, "object_mask_selector", None) is not None
+            ):
+                selected_view_masks = kf_gen.object_mask_selector(
+                    Image.fromarray(
+                        (kf_gen.image_latest[0].detach().cpu().clamp(0, 1)
+                         .permute(1, 2, 0).mul(255).round().byte().numpy())
+                    ),
+                    local_predictor=getattr(kf_gen.mask_generator, "predictor", None),
+                )
+                if not selected_view_masks:
+                    raise RuntimeError("Interactive object selection returned no masks")
+                normalized_masks = []
+                for selected_mask in selected_view_masks:
+                    selected_mask = np.asarray(selected_mask).astype(bool)
+                    if selected_mask.shape != (512, 512):
+                        selected_mask = cv2.resize(
+                            selected_mask.astype(np.uint8),
+                            (512, 512),
+                            interpolation=cv2.INTER_NEAREST,
+                        ).astype(bool)
+                    normalized_masks.append(selected_mask)
+                kf_gen.selected_object_masks = normalized_masks
+                kf_gen.defer_object_selection_until_expansion = False
             kf_gen.generate_layer(
                 pred_semantic_map=sem_seg,
                 foreground_ids=self.config.get("foreground_ids", [4, 76, 83, 87]),
@@ -303,6 +369,7 @@ class ExpansionManager:
                 ),
                 scene_name=scene_name,
                 use_precomputed_assets=False,
+                object_masks_override=selected_view_masks,
             )
             depth_should_be = kf_gen.depth_latest_init
             mask_to_align_depth = (
@@ -634,13 +701,18 @@ class MultiViewController:
         self.annotation_event.clear()
         self.reset_annotations()
         self.set_annotation_live_preview(live_preview)
-        self.set_pipeline_phase("PREPARING_ANNOTATION", "Preparing input image...")
-        # Always show the original input image in the frontend.  The current
-        # scene image may be an inpainted/recomposed cache after expansion.
-        display_image = getattr(self.genesis, "input_image", None)
-        if display_image is None:
-            display_image = self.genesis.annotation_image
-        self.set_annotation_frame(display_image)
+        preparing_message = (
+            "Preparing current view..." if live_preview else "Preparing input image..."
+        )
+        self.set_pipeline_phase("PREPARING_ANNOTATION", preparing_message)
+        if not live_preview:
+            # The raw input is only the first annotation surface.  After an
+            # expansion, the browser must keep and then resume the scene at the
+            # submitted camera pose instead of jumping back to input_image.
+            display_image = getattr(self.genesis, "input_image", None)
+            if display_image is None:
+                display_image = self.genesis.annotation_image
+            self.set_annotation_frame(display_image)
         self.set_pipeline_phase("WAITING_ANNOTATION", message)
         self.annotation_event.wait()
         annotations = self.get_annotations()

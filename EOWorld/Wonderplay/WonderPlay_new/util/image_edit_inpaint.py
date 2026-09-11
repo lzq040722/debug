@@ -56,6 +56,7 @@ class ImageEditInpaintPipeline:
         height=None,
         width=None,
         generator=None,
+        image_edit_seed=None,
         **kwargs,
     ):
         if image is None:
@@ -71,9 +72,8 @@ class ImageEditInpaintPipeline:
         )
         edit_image = image.convert("RGB").resize(target_size, resampling.LANCZOS)
         if generator is None:
-            generator = torch.Generator(device=self.device).manual_seed(
-                torch.initial_seed()
-            )
+            seed = torch.initial_seed() if image_edit_seed is None else int(image_edit_seed)
+            generator = torch.Generator(device=self.device).manual_seed(seed)
 
         inputs = {
             "image": edit_image,

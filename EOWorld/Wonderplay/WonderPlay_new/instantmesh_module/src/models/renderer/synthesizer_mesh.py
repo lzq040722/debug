@@ -73,10 +73,25 @@ class OSGDecoder(nn.Module):
         sdf = self.net_sdf(sampled_features)
         deformation = self.net_deformation(sampled_features)
 
-        grid_features = torch.index_select(input=sampled_features, index=flexicubes_indices.reshape(-1), dim=1)
-        grid_features = grid_features.reshape(
-            sampled_features.shape[0], flexicubes_indices.shape[0], flexicubes_indices.shape[1] * sampled_features.shape[-1])
-        weight = self.net_weight(grid_features) * 0.1
+        # At grid_res=128 there are 128^3 cubes.  Expanding all eight vertex
+        # features at once creates a [1, 2,097,152, 1,920] fp32 temporary
+        # (exactly 15 GiB).  Evaluate the independent per-cube MLP in chunks
+        # to preserve the result while bounding peak memory.
+        weight_chunks = []
+        cube_chunk_size = 65_536
+        for cube_indices in flexicubes_indices.split(cube_chunk_size, dim=0):
+            grid_features = torch.index_select(
+                input=sampled_features,
+                index=cube_indices.reshape(-1),
+                dim=1,
+            )
+            grid_features = grid_features.reshape(
+                sampled_features.shape[0],
+                cube_indices.shape[0],
+                cube_indices.shape[1] * sampled_features.shape[-1],
+            )
+            weight_chunks.append(self.net_weight(grid_features))
+        weight = torch.cat(weight_chunks, dim=1) * 0.1
 
         return sdf, deformation, weight
     

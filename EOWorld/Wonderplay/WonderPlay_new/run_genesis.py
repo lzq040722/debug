@@ -153,6 +153,8 @@ opt = None
 scene_dict = None
 style_prompt = None
 pt_gen = None
+object_mask_selector = None
+auxiliary_model_runtime = None
 
 sim = None
 movement = None
@@ -422,9 +424,15 @@ def _run_loaded_initial_scene(
     scene_name = content_list[0]
     # Frontend display uses ``input_image``. Backend motion preparation uses
     # the cached post-separation/inpaint interaction condition.
-    annotation_image = kf_gen.image_latest.detach().clone()
+    # The cached post-separation/inpaint image is the annotation surface for
+    # a loaded scene.  Keep the frontend and the interaction backend on the
+    # same image instead of falling back to the raw input frame.
+    input_image = kf_gen.image_latest.detach().clone()
+    annotation_image = input_image.detach().clone()
     annotation_depth = kf_gen.depth_latest.detach().clone()
     annotation_valid_mask = (~kf_gen.sky_mask_latest.bool()).detach().clone()
+
+    print("SAVING 3D RESULTS")
 
     object_infos = loaded["object_infos"]
     simulation_steps = config["simulation_steps"]
@@ -699,11 +707,6 @@ def prepare_environment_motion_fields(
         raise ValueError("No fixed_hints in config, cannot estimate environment motion")
 
     print(f"[environment_motion_prepare] Step 1: SAM3 segmentation with prompt='{sam_prompt}'")
-    from sam3.model_builder import build_sam3_image_model
-    from sam3.model.sam3_image_processor import Sam3Processor
-
-    sam3_model = build_sam3_image_model()
-    sam3_processor = Sam3Processor(sam3_model)
 
     # Motion annotations and SAM3 must use the exact input frame shown to the
     # user.  Gaussian re-composition is deliberately excluded here.
@@ -711,31 +714,39 @@ def prepare_environment_motion_fields(
     image_pil = ToPILImage()(image_tensor[0].detach().cpu().clamp(0, 1))
     image_pil.save(save_dir / "motion_input.png")
 
-    state = sam3_processor.set_image(image_pil)
-    prompts = [p.strip() for p in str(sam_prompt).split(",") if p.strip()]
-    masks_list = []
-    for prompt in prompts:
-        output = sam3_processor.set_text_prompt(state=state, prompt=prompt)
-        masks = output.get("masks", None)
-        if masks is None or (torch.is_tensor(masks) and masks.numel() == 0):
-            continue
-        masks_np = masks.detach().cpu().numpy() if torch.is_tensor(masks) else np.asarray(masks)
-        if masks_np.ndim == 2:
-            masks_np = masks_np[None, ...]
-        elif masks_np.ndim == 4:
-            if masks_np.shape[0] == 1:
-                masks_np = masks_np[0, ...]
-            if masks_np.ndim == 4 and masks_np.shape[1] == 1:
-                masks_np = masks_np[:, 0, :, :]
-        if masks_np.ndim == 3 and masks_np.shape[0] > 0:
-            masks_list.append(masks_np.astype(bool))
-
-    if len(masks_list) == 0:
-        raise RuntimeError(
-            f"SAM3 returned no masks for environment_motion.sam_prompt='{sam_prompt}'. "
-            "Please adjust the prompt so it selects the moving environment region."
+    if auxiliary_model_runtime is not None:
+        motion_mask_2d = auxiliary_model_runtime.segment_environment(
+            image_pil, sam_prompt
         )
     else:
+        from sam3.model_builder import build_sam3_image_model
+        from sam3.model.sam3_image_processor import Sam3Processor
+
+        sam3_model = build_sam3_image_model()
+        sam3_processor = Sam3Processor(sam3_model)
+        state = sam3_processor.set_image(image_pil)
+        prompts = [p.strip() for p in str(sam_prompt).split(",") if p.strip()]
+        masks_list = []
+        for prompt in prompts:
+            output = sam3_processor.set_text_prompt(state=state, prompt=prompt)
+            masks = output.get("masks", None)
+            if masks is None or (torch.is_tensor(masks) and masks.numel() == 0):
+                continue
+            masks_np = masks.detach().cpu().numpy() if torch.is_tensor(masks) else np.asarray(masks)
+            if masks_np.ndim == 2:
+                masks_np = masks_np[None, ...]
+            elif masks_np.ndim == 4:
+                if masks_np.shape[0] == 1:
+                    masks_np = masks_np[0, ...]
+                if masks_np.ndim == 4 and masks_np.shape[1] == 1:
+                    masks_np = masks_np[:, 0, :, :]
+            if masks_np.ndim == 3 and masks_np.shape[0] > 0:
+                masks_list.append(masks_np.astype(bool))
+        if not masks_list:
+            raise RuntimeError(
+                f"SAM3 returned no masks for environment_motion.sam_prompt='{sam_prompt}'. "
+                "Please adjust the prompt so it selects the moving environment region."
+            )
         motion_mask_2d = np.any(np.concatenate(masks_list, axis=0), axis=0)
 
     mask_area = motion_mask_2d.sum()
@@ -1620,17 +1631,22 @@ def interaction_rendering(
             traj_dir=traj_dir,
             fps=video_gen_fps,
             checkpoint_path=raft_checkpoint,
-            device=config["device"],
+            device="cuda:0",
         )
         realwonder_conditions = prepare_realwonder_conditions(
             save_dir, config=config, traj_id=0, overwrite=True
         )
         if status_callback is not None:
             status_callback("Video Refinement.")
-        refinement_result = run_realwonder_refinement(
-            realwonder_conditions,
-            config=config,
-        )
+        if auxiliary_model_runtime is not None:
+            refinement_result = auxiliary_model_runtime.run_realwonder(
+                realwonder_conditions
+            )
+        else:
+            refinement_result = run_realwonder_refinement(
+                realwonder_conditions,
+                config=config,
+            )
         empty_cache()
         if _video_scene_refinement_enabled(config):
             if status_callback is not None:
@@ -2085,26 +2101,33 @@ def _load_generation_models(config, motion_type):
     """Load models needed only when generating a new view or scene."""
     segment_processor, segment_model = load_oneformer()
     segment_model = segment_model.to("cuda")
-    mask_generator = create_mask_generator_repvit()
+    if auxiliary_model_runtime is not None:
+        mask_generator = auxiliary_model_runtime.mask_generator
+    else:
+        mask_generator = create_mask_generator_repvit()
 
     inpainting_backend = str(
         config.get("inpainting_backend", "stable_diffusion")
     ).lower()
     if inpainting_backend in {"image_edit", "qwen", "qwen_image_edit"}:
-        image_edit_checkpoint = config.get(
-            "image_edit_checkpoint", "/root/autodl-tmp/huggingface/hub"
-        )
-        print(
-            "[INFO] Loading ModelScope Qwen ImageEdit Plus inpainter from "
-            f"{image_edit_checkpoint} ..."
-        )
-        inpainter_pipeline = ImageEditInpaintPipeline.from_pretrained(
-            image_edit_checkpoint,
-            torch_dtype=torch.bfloat16,
-            local_files_only=True,
-        ).to(config["device"])
-        inpainter_pipeline.set_progress_bar_config(disable=None)
-        print("[INFO] Image-Edit inpainter loaded.")
+        if auxiliary_model_runtime is not None:
+            inpainter_pipeline = auxiliary_model_runtime.inpainting_pipeline
+            print("[INFO] Image-Edit is provided by the auxiliary GPU worker.")
+        else:
+            image_edit_checkpoint = config.get(
+                "image_edit_checkpoint", "/root/autodl-tmp/huggingface/hub"
+            )
+            print(
+                "[INFO] Loading ModelScope Qwen ImageEdit Plus inpainter from "
+                f"{image_edit_checkpoint} ..."
+            )
+            inpainter_pipeline = ImageEditInpaintPipeline.from_pretrained(
+                image_edit_checkpoint,
+                torch_dtype=torch.bfloat16,
+                local_files_only=True,
+            ).to(config["device"])
+            inpainter_pipeline.set_progress_bar_config(disable=None)
+            print("[INFO] Image-Edit inpainter loaded.")
     else:
         sd_checkpoint = config["stable_diffusion_checkpoint"]
         print(f"[INFO] Loading Stable Diffusion 2 inpainter from {sd_checkpoint} ...")
@@ -2196,7 +2219,12 @@ def run(config, dt_string=None):
     if motion_type == "interaction":
         validate_interaction_config(config)
 
-    if config.get("load_gen", False):
+    interactive_object_selection = (
+        object_mask_selector is not None and bool(config.get("gen_layer", False))
+    )
+    use_loaded_scene = bool(config.get("load_gen", False))
+
+    if use_loaded_scene:
         generation_models = {
             "segment_processor": None,
             "segment_model": None,
@@ -2252,9 +2280,11 @@ def run(config, dt_string=None):
         inpainting_resolution=config["inpainting_resolution_gen"],
         mvdiffusion=mvdiffusion,
         sam_model=None,
-        load_instantmesh=not config.get("load_gen", False),
+        load_instantmesh=not use_loaded_scene,
         dt_string=dt_string,
     ).to(config["device"])
+    kf_gen.object_mask_selector = object_mask_selector
+    kf_gen.defer_object_selection_until_expansion = use_loaded_scene and interactive_object_selection
 
     def ensure_generation_models():
         nonlocal generation_models
@@ -2339,7 +2369,7 @@ def run(config, dt_string=None):
     input_image = kf_gen.image_latest.detach().clone()
     annotation_image = input_image.detach().clone()
 
-    if config.get("load_gen", False):
+    if use_loaded_scene:
         print("[cache] Loading fixed initial scene; skipping scene reconstruction.")
         return _run_loaded_initial_scene(
             config=config,

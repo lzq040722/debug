@@ -341,9 +341,9 @@
 					<button id="send-button" title="Update the next scene prompt">Update</button>
 				</div>
 				<div class="button-grid">
-					<button id="start-button" title="Confirm the initial image or current motion annotations">Confirm</button>
+					<button id="start-button" title="Confirm the current selection or motion annotations">Confirm</button>
 					<button id="generate-button" title="Expand the scene at the current camera pose">Generate</button>
-					<button id="undo-button" title="Undo the latest expansion">Undo</button>
+					<button id="undo-button" title="Undo the latest selection point or expansion">Undo</button>
 					<button id="save-button" title="Save the Gaussian scene and motion model">Save</button>
 					<button id="fill-button" title="Generate while preserving the sky">Fill</button>
 					<button id="delete-button" title="Delete points visible from the current view">Delete</button>
@@ -354,7 +354,7 @@
 					<button id="sam-prompt-button" title="Set the SAM3 region text prompt">Set mask</button>
 				</div>
 				<div class="button-grid">
-					<button id="clear-motion-button" title="Clear all unsent motion arrows">Clear arrows</button>
+					<button id="clear-motion-button" title="Clear the current selection or motion arrows">Clear</button>
 					<button id="capture-button" title="Begin recording the dynamic render">Record</button>
 					<button id="stop-button" title="Stop recording and write an MP4">Stop</button>
 				</div>
@@ -392,6 +392,6 @@
 		</div>
 
 		<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.0/socket.io.js"></script>
-		<script src="main_stream.js?v=20260825-input-annotation-v4"></script>
+		<script src="main_stream.js?v=20260910-object-selection-v1"></script>
 	</body>
 </html>

@@ -166,3 +166,11 @@ b. 可以选用更少的3DGS进行模拟，最后交给视频优化就好
 
 
 [prepare_realwonder_input.py](/root/autodl-tmp/EOWorld/Wonderplay/prepare_realwonder_input.py)  我现在是使用这个脚本将目前产生的文件转换成realwonder所需要的格式，然后到对应的项目 /root/autodl-tmp/RealWonder 里边去在运行视频生成的部分，但是这样会显得很麻烦， 我需要你帮我把 RealWonderplay中有关视频生成的代码迁移过来。
+
+14. ssh -N -o ExitOnForwardFailure=yes -L 17778:127.0.0.1:7778 -p 40031 root@10.130.129.33
+
+15. 现在我们需要做以下修改：
+1) 我希望用户能够通过在前端点击那个物体进行交互，就加在选择运动的环境（water） 那一步之前，不再使用后端object_split_mask_sam_ids进行分割。增加更多的灵活性
+2) 为了进一步减少运行时间，我希望用两张卡来完成这个项目，一张卡用来加载正常的pipeline，另一张卡可以提前加载SAM、SAM3以及视频优化模型，Image_edit等大模型，这样等需要的条件产生之后我就可以直接输入到这么模型中进行处理，而不需要因为加载这些模型浪费大量的时间。
+3) 当然，我希望在完成双卡运行的基础上可以保留单卡运行的机制。 
+4) 请你对我以上两个方案进行理解，然后规划执行方案。

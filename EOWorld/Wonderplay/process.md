@@ -52,3 +52,9 @@
 
    该方案是对论文基本方法的针对性扩展：论文明确使用生成视频监督动态 3D 场景，并优化前景动态对象及背景颜色；当前工程中的水面被放在环境分支，因此需要额外把环境位置残差加入优化变量。第一阶段建议只优化被 SAM3 水面 mask 选中的环境 Gaussian，保持天空和静态建筑不变，以验证视频监督是否能够改善水面运动；如果有效，再考虑将残差从逐帧位置扩展为共享的环境流场或 HashGrid 参数。
 
+# 9/10 进度
+1. 双卡分布：
+GPU 0：OneFormer + Marigold Depth/Normals + Zero123Plus + InstantMesh + 3DGS
+GPU 1：RepViT-SAM + Qwen ImageEdit + SAM3 + RealWonder
+2. 环境传递给obj的速度没有全程作用：
+3. 为什么Generate 的图片和显示在前端的照片不一致？  

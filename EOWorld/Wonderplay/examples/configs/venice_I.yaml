@@ -115,6 +115,7 @@ multiview:
   enabled: True
   expansion_iterations: 100
   inpainting_steps: 40
+  image_edit_seed: 42
   stop: False
 load_gen: True
 

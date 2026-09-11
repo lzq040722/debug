@@ -824,10 +824,19 @@ class FrameSyn(torch.nn.Module):
             rendered_image=padded_rendered_image,
             **image_edit_kwargs,
         )
+        # Multiview expansions can use an explicit ImageEdit seed so their
+        # stochastic result is reproducible independently of the global seed.
+        if uses_image_edit and inpaint_context.startswith("multiview expansion"):
+            image_edit_seed = self.config.get("multiview", {}).get(
+                "image_edit_seed", None
+            )
+            if image_edit_seed is not None:
+                inpainting_inputs["image_edit_seed"] = int(image_edit_seed)
         if not getattr(self.inpainting_pipeline, "uses_image_edit", False):
             inpainting_inputs["mask_image"] = mask_image
 
         inpainted_image = self.inpainting_pipeline(**inpainting_inputs).images[0]
+        inpainted_image = inpainted_image.to(padded_rendered_image.device)
 
         inpainted_image = (
             (inpainted_image / 2 + 0.5).clamp(0, 1).to(torch.float32)[None]
@@ -2911,6 +2920,11 @@ class KeyframeGen(FrameSyn):
         self.no_loss_masks_layer = (
             []
         )  # Indicating which pixels to remove for layer in optimizing 3DGS
+        # Object masks selected by the frontend are kept for the whole run.
+        # ``object_masks`` is a short-lived buffer used while creating a layer;
+        # this copy is deliberately persistent so later multiview expansions
+        # cannot fall back to automatic semantic/SAM masks.
+        self.selected_object_masks = None
 
         ####### Set up attributes #######
         run_dir_root = Path(config["runs_dir"])
@@ -3751,6 +3765,7 @@ class KeyframeGen(FrameSyn):
         scene_name=None,
         use_precomputed_assets=True,
         use_cached_assets=False,
+        object_masks_override=None,
     ):
         ground_ids = {str(class_id) for class_id in ground_ids}
         foreground_ids = {str(class_id) for class_id in foreground_ids}
@@ -3787,11 +3802,15 @@ class KeyframeGen(FrameSyn):
 
         dilation_kernel = torch.ones(9, 9).to(self.device)
 
-        # also use SAM to generate the masks candiate
+        # Automatic SAM candidates are only needed for non-interactive views.
         image_pil = ToPILImage()(self.image_latest.squeeze())
         image_np = np.array(image_pil)
         sam_cache_path = Path(self.config["examples_dir"]) / "sam_masks.pt"
-        if use_cached_assets and sam_cache_path.is_file():
+        object_mask_selector = getattr(self, "object_mask_selector", None)
+        interactive_selection = use_precomputed_assets and object_mask_selector is not None
+        if interactive_selection:
+            sam_masks_np = {}
+        elif use_cached_assets and sam_cache_path.is_file():
             sam_masks_np = torch.load(
                 sam_cache_path, map_location="cpu", weights_only=False
             )
@@ -3891,54 +3910,83 @@ class KeyframeGen(FrameSyn):
                 # print(i, "disparity_mean:", disparity_mean, "segment_disparity_mean:", disparity_np[segment_boundary!=0].mean())
                 mask_disocclusion |= mask_i
 
-        '''
-        This is the current option to get the best object masks:
-        You need to set in config the object_split_mask_sam_ids, and the order matters!
-        then directly use those masks as object masks, no erosion or dilation, and rewrite the mask_disocclusion
-        '''
-        if use_precomputed_assets:
-            if "object_split_mask_sam_ids" not in self.config.keys():
-                print("No object_split_mask_sam_ids in config, check the segmentation folder to select the object masks ids!!")
-                raise NotImplementedError
-            object_split_mask_sam_ids = self.config["object_split_mask_sam_ids"]
-            mask_disocclusion = np.full((512, 512), False, dtype=bool)
-            self.object_masks = []
-            for object_number_id, sid in enumerate(object_split_mask_sam_ids):
-                combined_mask = np.full((512, 512), False, dtype=bool)
-                selected_sids = sid if isinstance(sid, (list, tuple)) else [sid]
-                for siid in selected_sids:
-                    if siid not in sam_masks_np:
-                        available = ", ".join(str(k) for k in sorted(sam_masks_np.keys()))
-                        raise ValueError(
-                            f"object_split_mask_sam_ids contains SAM mask id {siid}, "
-                            f"but available saved SAM ids are [{available}]. "
-                            "Choose ids from segmentation/sam_mask_XX_rgb.png."
-                        )
-                    mask_disocclusion |= sam_masks_np[siid]
-                    combined_mask |= sam_masks_np[siid]
-                # if selected_sids is empty, you can pass this and should have an existing mask in tmp/
-                
-                # also if in examples_dir, there is {example_name}_object_{id}.png, then also use it
-                _examples_dir = self.config.get("examples_dir", os.path.join("examples", "imgs", self.config["example_name"]))
-                _path = os.path.join(_examples_dir, f"object_mask_{object_number_id}.png")
-                if os.path.exists(_path):
-                    existing_sam_mask = np.array(Image.open(_path))
-                    existing_sam_mask = existing_sam_mask[..., 0] > 0
-                    combined_mask |= existing_sam_mask
-                    mask_disocclusion |= existing_sam_mask
+        # The frontend selection is the source of truth for the foreground
+        # object.  It is captured once on the initial view and then reused by
+        # every subsequent multiview call (which passes use_precomputed_assets
+        # as False).  Automatic semantic/SAM candidates are only used when no
+        # frontend selection exists, preserving the non-interactive pipeline.
+        selected_masks = (
+            object_masks_override
+            if object_masks_override is not None
+            else self.selected_object_masks
+        )
+        if (
+            object_masks_override is None
+            and use_precomputed_assets
+            and object_mask_selector is not None
+        ):
+            selected_masks = object_mask_selector(
+                image_pil,
+                local_predictor=getattr(self.mask_generator, "predictor", None),
+            )
+            if not selected_masks:
+                raise RuntimeError("Interactive object selection returned no masks")
 
-                self.object_masks.append(torch.from_numpy(combined_mask).float().unsqueeze(0).unsqueeze(0).to(self.device))
+        if selected_masks is None:
+            # A loaded/cached run may not have the in-memory selection, but the
+            # initial layer writes object_00.png before this visualization is
+            # generated. Reuse those exact frontend masks when available.
+            persisted = sorted(
+                (self.run_dir / "segmentation").glob("object_*.png"),
+                key=lambda path: path.name,
+            )
+            if persisted:
+                selected_masks = [
+                    cv2.imread(path.as_posix(), cv2.IMREAD_GRAYSCALE) > 0
+                    for path in persisted
+                ]
+
+        if selected_masks is not None:
+            normalized_masks = []
+            for selected_mask in selected_masks:
+                combined_mask = np.asarray(selected_mask).astype(bool)
+                if combined_mask.shape != (512, 512):
+                    combined_mask = cv2.resize(
+                        combined_mask.astype(np.uint8),
+                        (512, 512),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(bool)
+                normalized_masks.append(combined_mask)
+            if object_masks_override is None:
+                self.selected_object_masks = normalized_masks
+            mask_disocclusion = np.logical_or.reduce(normalized_masks)
+            self.object_masks = [
+                torch.from_numpy(mask).float().unsqueeze(0).unsqueeze(0).to(self.device)
+                for mask in normalized_masks
+            ]
+
+            # Persist the exact click-derived masks before creating the hole
+            # visualization. This makes object_00.png (and additional object
+            # masks, if any) the auditable source for all later views.
+            segmentation_dir = self.run_dir / "segmentation"
+            segmentation_dir.mkdir(exist_ok=True, parents=True)
+            for object_id, mask in enumerate(normalized_masks):
+                cv2.imwrite(
+                    (segmentation_dir / f"object_{object_id:02d}.png").as_posix(),
+                    (mask.astype(np.uint8) * 255),
+                )
         cv2.imwrite((self.run_dir / f"segmentation/sam_mask_disocclusion.png").as_posix(), (mask_disocclusion*255).astype(np.uint8))
         
-        inpainting_prompt = (
-            scene_name
-            if scene_name is not None
-            else self.config["base_inpainting_prompt"]
+        # This inpainting pass removes the selected foreground object from the
+        # base layer.  ``scene_name`` is derived from the first item in the
+        # scene content prompt (for example, "The Grand Canal in Venice") and
+        # describes the overall scene; it is not an instruction for foreground
+        # removal.  Use the dedicated config prompts for this operation.
+        inpainting_prompt = self.config.get(
+            "base_inpainting_prompt", "Remove the selected foreground object."
         )
-        inpainting_negative_prompt = (
-            "tree, plant"
-            if scene_name is not None
-            else self.config.get("base_inpainting_negative_prompt", "tree, plant")
+        inpainting_negative_prompt = self.config.get(
+            "base_inpainting_negative_prompt", "tree, plant"
         )
         mask_disocclusion = torch.from_numpy(mask_disocclusion)[None, None]
 
@@ -3953,11 +4001,34 @@ class KeyframeGen(FrameSyn):
         is_tmp = use_precomputed_assets
         _examples_dir = self.config.get("examples_dir", os.path.join("examples", "imgs", self.config["example_name"]))
         
-        inpaint_mask = (
-            self.mask_disocclusion > 0.5
-        )  # Erode a bit to prevent over-inpaint
+        # The hole visualization and inpainting mask must match the frontend's
+        # object_00.png exactly. Keep the eroded mask above for depth/point
+        # cloud stabilization, but do not substitute it for object removal.
         segmentation_dir = self.run_dir / "segmentation"
         segmentation_dir.mkdir(exist_ok=True, parents=True)
+        object_mask_path = segmentation_dir / "object_00.png"
+        if object_mask_path.is_file():
+            # Read back the canonical artifact so the visualization is
+            # guaranteed to correspond pixel-for-pixel to object_00.png.
+            object_mask_np = cv2.imread(
+                object_mask_path.as_posix(), cv2.IMREAD_GRAYSCALE
+            )
+            if object_mask_np is None:
+                raise RuntimeError(f"Failed to read selected object mask: {object_mask_path}")
+            object_inpaint_mask = torch.from_numpy(object_mask_np > 0)[None, None].to(
+                self.device
+            )
+        else:
+            # Non-interactive legacy runs have no object_00 artifact; retain
+            # their automatic mask behavior as a compatibility fallback.
+            object_inpaint_mask = torch.from_numpy(mask_disocclusion)[None, None].to(
+                self.device
+            )
+        inpaint_mask = object_inpaint_mask > 0.5
+        print(
+            f"[INFO] Foreground-removal mask source: "
+            f"{object_mask_path if object_mask_path.is_file() else 'automatic mask fallback'}"
+        )
         hole_vis = self.image_latest_init.clone()
         hole_vis = hole_vis * (~inpaint_mask).float()
         ToPILImage()(hole_vis[0]).save(segmentation_dir / "foreground_removed_hole.png")
@@ -3976,7 +4047,8 @@ class KeyframeGen(FrameSyn):
             f"{segmentation_dir / 'foreground_removed_hole.png'}"
         )
         _base_layer_path = Path(_examples_dir) / "base_layer.png"
-        if use_cached_assets and _base_layer_path.is_file():
+        can_use_cached_base = use_cached_assets and not interactive_selection
+        if can_use_cached_base and _base_layer_path.is_file():
             inpainter_output = ToTensor()(
                 Image.open(_base_layer_path).convert("RGB").resize((512, 512))
             )[None].to(self.device)
@@ -3999,7 +4071,12 @@ class KeyframeGen(FrameSyn):
             kernel=torch.ones(5, 5).to(self.device),
         )  # keep it slightly dilated to prevent dirty artifacts
         
-        if is_tmp and _base_layer_path.exists() and not use_cached_assets:
+        if (
+            is_tmp
+            and _base_layer_path.exists()
+            and not use_cached_assets
+            and not interactive_selection
+        ):
             inpainter_output = ToTensor()(
                 Image.open(_base_layer_path).convert("RGB").resize((512, 512))
             )[None].to(self.device)
@@ -4010,12 +4087,13 @@ class KeyframeGen(FrameSyn):
         self.image_latest = soft_stitching(
             inpainter_output, self.image_latest_init, stitch_mask, sigma=1, blur_size=3
         )
-        if use_cached_assets and not _base_layer_path.is_file():
+        if can_use_cached_base and not _base_layer_path.is_file():
             _base_layer_path.parent.mkdir(parents=True, exist_ok=True)
             ToPILImage()(self.image_latest[0].clamp(0, 1)).save(_base_layer_path)
         ToPILImage()(self.image_latest[0]).save(
             segmentation_dir / "background_inpainted.png"
         )
+        Image.open(_base_layer_path).convert("RGB").resize((512, 512)).save(segmentation_dir / "background_inpainted.png")
         print(
             "[INFO] Foreground/background separation and background inpainting complete. "
             f"Mask: {segmentation_dir / 'sam_mask_disocclusion.png'}, "
